@@ -63,6 +63,26 @@ def load_defaults_from_json():
 # 节点加载时先运行一次初始化默认值
 DEFAULT_MAPPING_TEXT, DEFAULT_ORDER_TEXT = load_defaults_from_json()
 
+CATEGORY_MAPPING_PLACEHOLDER = (
+    "示例1（精确元组）:\n"
+    '{("人物","对象"): "人物对象词"}\n\n'
+    "示例2（仅大类）:\n"
+    '{"人物": "人物对象词"}\n\n'
+    "示例3（大类通配）:\n"
+    '{("服饰","*"): "服饰词"}\n\n'
+    "可混合使用，优先级: (大类,子类) > 大类 > (大类,*)"
+)
+
+CATEGORY_ORDER_PLACEHOLDER = (
+    "支持三种写法:\n"
+    '1) JSON: ["背景词","人物对象词","未归类词"]\n'
+    "2) Python: ['背景词','人物对象词','未归类词']\n"
+    "3) 每行一个分类:\n"
+    "背景词\n"
+    "人物对象词\n"
+    "未归类词"
+)
+
 
 def _parse_tag_string(tag_string: str) -> List[str]:
     """
@@ -124,6 +144,95 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
+def _extract_tags_text_from_payload(raw_value: Any, depth: int = 0) -> str:
+    if depth > 3:
+        return ""
+
+    if isinstance(raw_value, str):
+        text = raw_value.strip()
+        if not text:
+            return ""
+
+        # 优先解析完整 JSON 字符串（例如上游传入 metadata payload）。
+        try:
+            parsed = json.loads(text)
+            extracted = _extract_tags_text_from_payload(parsed, depth + 1)
+            if extracted:
+                return extracted
+        except Exception:
+            pass
+
+        # 兜底：字符串里夹了 JSON 片段时，尝试提取常见字段。
+        for key in ("tags", "tag_string", "prompt", "caption", "text"):
+            pattern = re.compile(rf'"{re.escape(key)}"\s*:\s*"((?:\\.|[^"\\])*)"', re.IGNORECASE | re.DOTALL)
+            match = pattern.search(text)
+            if not match:
+                continue
+            try:
+                return json.loads(f'"{match.group(1)}"')
+            except Exception:
+                return match.group(1)
+
+        return text
+
+    if isinstance(raw_value, dict):
+        for key in ("tags", "tag_string", "prompt", "caption", "text"):
+            if key not in raw_value:
+                continue
+            extracted = _extract_tags_text_from_payload(raw_value.get(key), depth + 1)
+            if extracted:
+                return extracted
+
+        selections = raw_value.get("selections")
+        if isinstance(selections, list):
+            chunks: List[str] = []
+            for item in selections:
+                extracted = _extract_tags_text_from_payload(item, depth + 1)
+                if extracted:
+                    chunks.append(extracted)
+            if chunks:
+                return ", ".join(chunks)
+
+        for value in raw_value.values():
+            if isinstance(value, (dict, list)):
+                extracted = _extract_tags_text_from_payload(value, depth + 1)
+                if extracted:
+                    return extracted
+        return ""
+
+    if isinstance(raw_value, list):
+        chunks: List[str] = []
+        for item in raw_value:
+            extracted = _extract_tags_text_from_payload(item, depth + 1)
+            if extracted:
+                chunks.append(extracted)
+        return ", ".join(chunks)
+
+    return str(raw_value or "").strip()
+
+
+def _is_metadata_like_token(token: str) -> bool:
+    text = str(token or "").strip().lower()
+    if not text:
+        return True
+
+    if "http://" in text or "https://" in text:
+        return True
+
+    metadata_prefixes = (
+        '{"', '{"selections"', '"selections"', '"post_id"', '"image_url"', '"prompt"',
+        '"tags"', '"caption"', '"text"',
+    )
+    if text.startswith(metadata_prefixes):
+        return True
+
+    # JSON 碎片：例如 `"foo":`、`...}` 等。
+    if ":" in text and (text.startswith("{") or text.startswith('"') or text.endswith("}") or text.endswith("]")):
+        return True
+
+    return False
+
+
 def _resolve_excel_path(excel_file: str) -> str:
     """
     将用户输入的 excel_file 解析成可用路径。
@@ -135,6 +244,15 @@ def _resolve_excel_path(excel_file: str) -> str:
     if os.path.isabs(excel_file) and os.path.exists(excel_file):
         return excel_file
     return os.path.join(data_base_dir, excel_file)
+
+
+def _clean_sheet_text(value: Any) -> str:
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value).strip()
 
 
 def _parse_input_data(raw_input: Any, default_text: str, expected_type: type):
@@ -165,6 +283,24 @@ def _parse_input_data(raw_input: Any, default_text: str, expected_type: type):
     except Exception:
         pass
 
+    # 兼容前端设置里按行填写分类（非 JSON/Python list）：
+    # 每行一个分类，或逗号分隔均可。
+    if expected_type is list:
+        rough_items = re.split(r'[\r\n,]+', text)
+        normalized_items: List[str] = []
+        seen = set()
+        for raw_item in rough_items:
+            item = str(raw_item).strip().strip('"').strip("'").strip()
+            item = re.sub(r'^[\[\{\(]+|[\]\}\)]+$', '', item).strip()
+            if re.fullmatch(r'[\[\]\{\}\(\)\s]+', item):
+                continue
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            normalized_items.append(item)
+        if normalized_items:
+            return normalized_items
+
     try:
         parsed = ast.literal_eval(default_text)
         if isinstance(parsed, expected_type):
@@ -173,6 +309,25 @@ def _parse_input_data(raw_input: Any, default_text: str, expected_type: type):
         pass
 
     return {} if expected_type is dict else []
+
+
+def _build_category_order(new_category_order: Any, default_category: str) -> List[str]:
+    ordered: List[str] = []
+    seen = set()
+
+    if isinstance(new_category_order, list):
+        for item in new_category_order:
+            name = str(item).strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            ordered.append(name)
+
+    default_name = str(default_category or "").strip()
+    if default_name and default_name not in seen:
+        ordered.append(default_name)
+
+    return ordered
 
 
 def _execute_sorting(
@@ -195,14 +350,18 @@ def _execute_sorting(
     final_excel_path = _resolve_excel_path(excel_file)
 
     cat_map = _parse_input_data(category_mapping, DEFAULT_MAPPING_TEXT, dict)
-    cat_order = _parse_input_data(new_category_order, DEFAULT_ORDER_TEXT, list)
+    parsed_order = _parse_input_data(new_category_order, DEFAULT_ORDER_TEXT, list)
+    cat_order = _build_category_order(parsed_order, default_category)
 
     if validation:
         used = set(cat_map.values())
         defined = set(cat_order)
         missing = used - defined
         if missing:
-            raise ValueError(f"\n[配置错误喵]Mapping中使用了未在Order中定义的分类: {list(missing)}")
+            print(
+                f"[DanbooruTagToolkit] Validation warning: mapping中存在未在order定义的分类 {list(missing)}，"
+                f"这些tag会在排序阶段落入默认分类 {default_category!r}。"
+            )
 
     if force_reload:
         global _tag_cache
@@ -216,12 +375,15 @@ def _execute_sorting(
         tag_blacklist,
         deduplicate_tags
     )
+    for category in cat_order:
+        cat_dict.setdefault(category, "")
     return all_str, cat_dict, final_excel_path, cat_map, cat_order
 
 
 def _select_from_bundle(
     tag_bundle: Dict[str, Any],
     selected_tags_json: Any,
+    selected_categories_json: Any,
     separator: str,
     use_all_when_empty: bool,
     deduplicate_selected: bool,
@@ -229,6 +391,7 @@ def _select_from_bundle(
 ):
     normalized_bundle = _normalize_bundle_for_ui(tag_bundle)
     selected_list = _safe_parse_json_list(selected_tags_json, [])
+    selected_categories = _safe_parse_json_list(selected_categories_json, [])
     use_all_when_empty = _as_bool(use_all_when_empty, True)
     deduplicate_selected = _as_bool(deduplicate_selected, True)
     normalized_separator = str(separator or "comma").strip()
@@ -248,14 +411,32 @@ def _select_from_bundle(
                 available_map[key] = tag
                 all_tags.append(tag)
 
-    if not selected_list and use_all_when_empty:
-        merged_tags = list(all_tags)
-    else:
+    category_name_map: Dict[str, str] = {}
+    for category in normalized_bundle.keys():
+        normalized_key = str(category).strip().lower()
+        if normalized_key and normalized_key not in category_name_map:
+            category_name_map[normalized_key] = category
+
+    resolved_categories: List[str] = []
+    for category in selected_categories:
+        normalized_key = str(category).strip().lower()
+        if normalized_key in category_name_map:
+            resolved_categories.append(category_name_map[normalized_key])
+
+    if selected_list:
         merged_tags = []
         for item in selected_list:
             normalized_item = str(item).strip().lower()
             if normalized_item in available_map:
                 merged_tags.append(available_map[normalized_item])
+    elif resolved_categories:
+        merged_tags = []
+        for category in resolved_categories:
+            merged_tags.extend(normalized_bundle.get(category, []))
+    elif use_all_when_empty:
+        merged_tags = list(all_tags)
+    else:
+        merged_tags = []
 
     if deduplicate_selected and merged_tags:
         seen = set()
@@ -300,7 +481,18 @@ class DanbooruTagSorter:
     def get_new_category(self, original_category, original_subcategory):
         key = (original_category, original_subcategory)
         # 如果查不到就返回default_category，由用户自己设定
-        return self.category_mapping.get(key, self.default_category)
+        if key in self.category_mapping:
+            return self.category_mapping[key]
+
+        category_key = str(original_category or "").strip()
+        if category_key in self.category_mapping:
+            return self.category_mapping[category_key]
+
+        wildcard_key = (category_key, "*")
+        if wildcard_key in self.category_mapping:
+            return self.category_mapping[wildcard_key]
+
+        return self.default_category
 
     # 生成哈希键
     # 判断当前的配置参数是否和上次缓存一致
@@ -309,7 +501,6 @@ class DanbooruTagSorter:
             "excel_path": self.excel_path,
             # 将字典排序后dump为string，这样即使字典的key顺序不同，生成的哈希也一致
             "category_mapping": json.dumps(sorted(self.category_mapping.items())),
-            "new_category_order": json.dumps(self.new_category_order),
             "default_category": self.default_category
         }
         params_str = json.dumps(params, sort_keys=True)
@@ -342,9 +533,11 @@ class DanbooruTagSorter:
             #遍历每一行，构建哈希表查询
             for index, row in df.iterrows():
                 #清洗，转小写、去空格
-                eng_tag = str(row['english']).strip().lower()
-                cat = str(row['category']).strip()
-                sub = str(row['subcategory']).strip()
+                eng_tag = _clean_sheet_text(row.get('english', '')).lower()
+                cat = _clean_sheet_text(row.get('category', ''))
+                sub = _clean_sheet_text(row.get('subcategory', ''))
+                if not eng_tag:
+                    continue
 
                 #计算该tag映射后是谁家的兵
                 new_cat = self.get_new_category(cat, sub)
@@ -370,6 +563,7 @@ class DanbooruTagSorter:
     def process_tags(self, raw_string, add_category_comment=True,
                      regex_blacklist="", tag_blacklist="",
                      deduplicate=False):
+        raw_string = _extract_tags_text_from_payload(raw_string)
         # 拆分输入字符串转列表
         input_tags = [t.strip() for t in raw_string.split(',') if t.strip()]
 
@@ -404,6 +598,8 @@ class DanbooruTagSorter:
         # 遍历每一个输入tag进行匹配
         for tag in input_tags:
             tag_clean = tag.strip()
+            if _is_metadata_like_token(tag_clean):
+                continue
             tag_lower = tag_clean.lower()
             # 黑名单check
             if (tag_lower in exact_blacklist_set or
@@ -479,12 +675,12 @@ class DanbooruTagSorterNode:
                 "category_mapping": ("STRING", {
                     "multiline": True,
                     "default": DEFAULT_MAPPING_TEXT,
-                    "placeholder": "这里请输入小类映射到新分类的字典喵...注意语法正确喵..."
+                    "placeholder": CATEGORY_MAPPING_PLACEHOLDER
                 }),
                 "new_category_order": ("STRING", {
                     "multiline": True,
                     "default": DEFAULT_ORDER_TEXT,
-                    "placeholder": "这里请输入新分类以及输出顺序喵...注意语法正确喵..."
+                    "placeholder": CATEGORY_ORDER_PLACEHOLDER
                 }),
                 "default_category": ("STRING", {"default": "未归类词"}),
                 "regex_blacklist": ("STRING", {"default": ""}),
@@ -579,6 +775,7 @@ class DanbooruTagSelectorNode:
                 "keep_trailing_comma": ("BOOLEAN", {"default": True, "label": "尾部逗号"}),
                 # 用 optional + 前端隐藏，确保会随 workflow 序列化并传入后端
                 "selected_tags_json": ("STRING", {"default": "[]", "multiline": True}),
+                "selected_categories_json": ("STRING", {"default": "[]", "multiline": True}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -620,11 +817,13 @@ class DanbooruTagSelectorNode:
         deduplicate_selected=True,
         keep_trailing_comma=True,
         selected_tags_json="[]",
+        selected_categories_json="[]",
         unique_id=None,
     ):
         selected_text, normalized_bundle = _select_from_bundle(
             tag_bundle=tag_bundle,
             selected_tags_json=selected_tags_json,
+            selected_categories_json=selected_categories_json,
             separator=separator,
             use_all_when_empty=use_all_when_empty,
             deduplicate_selected=deduplicate_selected,
@@ -669,12 +868,12 @@ class DanbooruTagSorterSelectorNode:
                 "category_mapping": ("STRING", {
                     "multiline": True,
                     "default": DEFAULT_MAPPING_TEXT,
-                    "placeholder": "这里请输入小类映射到新分类的字典喵...注意语法正确喵..."
+                    "placeholder": CATEGORY_MAPPING_PLACEHOLDER
                 }),
                 "new_category_order": ("STRING", {
                     "multiline": True,
                     "default": DEFAULT_ORDER_TEXT,
-                    "placeholder": "这里请输入新分类以及输出顺序喵...注意语法正确喵..."
+                    "placeholder": CATEGORY_ORDER_PLACEHOLDER
                 }),
                 "default_category": ("STRING", {"default": "未归类词"}),
                 "regex_blacklist": ("STRING", {"default": ""}),
@@ -695,6 +894,7 @@ class DanbooruTagSorterSelectorNode:
                 "keep_trailing_comma": ("BOOLEAN", {"default": True, "label": "尾部逗号"}),
                 # 用 optional + 前端隐藏，确保会随 workflow 序列化并传入后端
                 "selected_tags_json": ("STRING", {"default": "[]", "multiline": True}),
+                "selected_categories_json": ("STRING", {"default": "[]", "multiline": True}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -725,6 +925,7 @@ class DanbooruTagSorterSelectorNode:
         deduplicate_selected=True,
         keep_trailing_comma=True,
         selected_tags_json="[]",
+        selected_categories_json="[]",
         unique_id=None,
     ):
         all_str, cat_dict, _, _, _ = _execute_sorting(
@@ -744,6 +945,7 @@ class DanbooruTagSorterSelectorNode:
         selected_text, normalized_bundle = _select_from_bundle(
             tag_bundle=cat_dict,
             selected_tags_json=selected_tags_json,
+            selected_categories_json=selected_categories_json,
             separator=separator,
             use_all_when_empty=use_all_when_empty,
             deduplicate_selected=deduplicate_selected,

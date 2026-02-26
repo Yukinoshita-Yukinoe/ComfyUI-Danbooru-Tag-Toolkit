@@ -16,7 +16,7 @@ const I18N = {
         view_categories: "Categories",
         view_selected: "Selected",
         panel_categories: "Categories",
-        panel_hint_categories: "Click tags to select.",
+        panel_hint_categories: "Pick categories first, then click tags if available.",
         panel_selected: "Selected Category Rows",
         panel_hint_selected: "One row per category, tags joined by commas.",
         ph_search: "Search tags/category...",
@@ -24,10 +24,13 @@ const I18N = {
         btn_none_visible: "None Visible",
         btn_all: "All",
         btn_none: "None",
+        btn_pick_category: "Pick Cat",
+        btn_unpick_category: "Unpick Cat",
         filter_all_categories: "All Categories ({count})",
         empty_no_preview_integrated: "No preview data. Check tags/config and refresh.",
         empty_no_data_selector: "No data. Run workflow then refresh.",
         empty_no_selected_rows: "No selected category rows.",
+        empty_selected_line: "(no tags yet)",
         empty_preview: "(empty)",
         meta_line: "Output tags: {output} | Selected tags: {selected} | Selected categories: {categories}",
         status_ready: "Ready.",
@@ -40,6 +43,27 @@ const I18N = {
         status_no_cached: "No cached category data yet. Run workflow once.",
         status_no_data: "No category data yet. Run workflow then refresh.",
         status_failed: "Failed to load categories.",
+        settings_title: "Node Settings",
+        settings_sorter: "Sorter",
+        settings_output: "Output",
+        settings_excel: "Excel / CSV file",
+        settings_mapping: "Category mapping",
+        settings_order: "Category order",
+        settings_default_category: "Default category",
+        settings_regex_blacklist: "Regex blacklist",
+        settings_tag_blacklist: "Tag blacklist",
+        settings_dedup_before_sort: "Deduplicate tags before sort",
+        settings_validation: "Validate category mapping",
+        settings_reload: "Force reload database",
+        settings_comment: "Keep category comments",
+        settings_prefix: "Prefix text",
+        settings_separator: "Separator",
+        settings_use_all_empty: "Use all when none selected",
+        settings_dedup_selected: "Deduplicate selected tags",
+        settings_keep_trailing: "Keep trailing separator",
+        settings_sep_comma: "Comma",
+        settings_sep_newline: "Newline",
+        settings_sep_space: "Space",
     },
     zh: {
         title_integrated: "Danbooru 标签工具箱 - 一体化",
@@ -52,7 +76,7 @@ const I18N = {
         view_categories: "分类",
         view_selected: "已选",
         panel_categories: "分类",
-        panel_hint_categories: "点击标签进行选择。",
+        panel_hint_categories: "可先选分类；有标签时再点标签精细选择。",
         panel_selected: "已选分类行",
         panel_hint_selected: "每个分类一行，标签用逗号拼接。",
         ph_search: "搜索标签/分类...",
@@ -60,10 +84,13 @@ const I18N = {
         btn_none_visible: "清空可见",
         btn_all: "全选",
         btn_none: "清空",
+        btn_pick_category: "选分类",
+        btn_unpick_category: "取消分类",
         filter_all_categories: "全部分类 ({count})",
         empty_no_preview_integrated: "暂无预览数据，请检查 tags/配置后刷新。",
         empty_no_data_selector: "暂无数据，请先运行工作流再刷新。",
         empty_no_selected_rows: "暂无已选分类行。",
+        empty_selected_line: "(暂无标签)",
         empty_preview: "(空)",
         meta_line: "输出标签: {output} | 已选标签: {selected} | 已选分类: {categories}",
         status_ready: "就绪。",
@@ -76,6 +103,27 @@ const I18N = {
         status_no_cached: "暂无缓存分类数据，请先运行一次工作流。",
         status_no_data: "暂无分类数据，请先运行工作流后刷新。",
         status_failed: "加载分类失败。",
+        settings_title: "节点设置",
+        settings_sorter: "分类器",
+        settings_output: "输出",
+        settings_excel: "Excel / CSV 文件",
+        settings_mapping: "分类映射",
+        settings_order: "分类顺序",
+        settings_default_category: "默认分类",
+        settings_regex_blacklist: "正则黑名单",
+        settings_tag_blacklist: "标签黑名单",
+        settings_dedup_before_sort: "分类前去重",
+        settings_validation: "校验分类映射",
+        settings_reload: "强制重载数据库",
+        settings_comment: "保留分类注释",
+        settings_prefix: "前缀文本",
+        settings_separator: "分隔符",
+        settings_use_all_empty: "未选择时输出全部",
+        settings_dedup_selected: "输出标签去重",
+        settings_keep_trailing: "保留尾部分隔符",
+        settings_sep_comma: "逗号",
+        settings_sep_newline: "换行",
+        settings_sep_space: "空格",
     },
 };
 
@@ -279,6 +327,10 @@ function injectStyle() {
             border-radius: 8px;
             background: #101d2e;
             padding: 6px;
+        }
+        .dts-category.dts-category-selected {
+            border-color: #e4a654;
+            box-shadow: 0 0 0 1px rgba(228, 166, 84, .25);
         }
         .dts-category-head {
             display: flex;
@@ -647,12 +699,19 @@ function coerceBoolWidget(widget, defaultValue) {
 
 function sanitizeLegacyWidgetValues(node) {
     const selectedWidget = getWidget(node, "selected_tags_json");
+    const selectedCategoriesWidget = getWidget(node, "selected_categories_json");
     const separatorWidget = getWidget(node, "separator");
 
     if (selectedWidget) {
         const normalizedSelection = JSON.stringify(parseSelected(selectedWidget.value));
         if (String(selectedWidget.value ?? "") !== normalizedSelection) {
             setWidgetValue(selectedWidget, normalizedSelection);
+        }
+    }
+    if (selectedCategoriesWidget) {
+        const normalizedCategories = JSON.stringify(parseSelected(selectedCategoriesWidget.value));
+        if (String(selectedCategoriesWidget.value ?? "") !== normalizedCategories) {
+            setWidgetValue(selectedCategoriesWidget, normalizedCategories);
         }
     }
 
@@ -689,6 +748,10 @@ function parseSelected(rawValue) {
 
 function normalizeTag(tag) {
     return String(tag || "").trim().toLowerCase();
+}
+
+function normalizeCategory(category) {
+    return String(category || "").trim().toLowerCase();
 }
 
 function getInputSlot(node, name) {
@@ -799,18 +862,72 @@ function getSelectedByCategory(state) {
     return byCategory;
 }
 
-function updateCategoryOrderFromSelection(state) {
-    const byCategory = getSelectedByCategory(state);
-    const selectedCategories = Object.keys(byCategory);
-    const kept = (state.categoryOrder || []).filter(cat => selectedCategories.includes(cat));
-    const existing = new Set(kept);
-    for (const category of Object.keys(state.categories)) {
-        if (selectedCategories.includes(category) && !existing.has(category)) {
-            kept.push(category);
-            existing.add(category);
+function getExplicitSelectedCategories(state) {
+    const categoryLookup = {};
+    for (const category of Object.keys(state.categories || {})) {
+        const key = normalizeCategory(category);
+        if (!(key in categoryLookup)) {
+            categoryLookup[key] = category;
         }
     }
-    state.categoryOrder = kept;
+
+    const selected = [];
+    const seen = new Set();
+    for (const category of state.selectedCategories || []) {
+        const key = normalizeCategory(category);
+        const resolved = categoryLookup[key];
+        if (!resolved || seen.has(key)) continue;
+        seen.add(key);
+        selected.push(resolved);
+    }
+    return selected;
+}
+
+function getActiveSelectedCategories(state) {
+    const byCategory = getSelectedByCategory(state);
+    const explicitSelected = getExplicitSelectedCategories(state);
+    const activeKeys = new Set([
+        ...Object.keys(byCategory).map(normalizeCategory),
+        ...explicitSelected.map(normalizeCategory),
+    ]);
+
+    const categoryLookup = {};
+    for (const category of Object.keys(state.categories || {})) {
+        const key = normalizeCategory(category);
+        if (!(key in categoryLookup)) {
+            categoryLookup[key] = category;
+        }
+    }
+
+    const ordered = [];
+    const seen = new Set();
+    for (const category of state.categoryOrder || []) {
+        const key = normalizeCategory(category);
+        const resolved = categoryLookup[key];
+        if (!resolved || !activeKeys.has(key) || seen.has(key)) continue;
+        seen.add(key);
+        ordered.push(resolved);
+    }
+
+    for (const category of explicitSelected) {
+        const key = normalizeCategory(category);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        ordered.push(category);
+    }
+
+    for (const category of Object.keys(state.categories || {})) {
+        const key = normalizeCategory(category);
+        if (!activeKeys.has(key) || seen.has(key)) continue;
+        seen.add(key);
+        ordered.push(category);
+    }
+
+    return ordered;
+}
+
+function updateCategoryOrderFromSelection(state) {
+    state.categoryOrder = getActiveSelectedCategories(state);
 }
 
 function getOrderedSelectedTags(state) {
@@ -848,6 +965,7 @@ function getOutputTagsForPreview(node) {
     if (!state) return [];
 
     const selectedTags = getOrderedSelectedTags(state);
+    const selectedCategories = getExplicitSelectedCategories(state);
     const useAllWhenEmpty = normalizeBooleanValue(getWidgetValue(node, "use_all_when_empty", true), true);
     const deduplicateSelected = normalizeBooleanValue(getWidgetValue(node, "deduplicate_selected", true), true);
 
@@ -864,15 +982,19 @@ function getOutputTagsForPreview(node) {
     }
 
     let mergedTags = [];
-    if (!selectedTags.length && useAllWhenEmpty) {
-        mergedTags = [...allTags];
-    } else {
+    if (selectedTags.length) {
         for (const tag of selectedTags) {
             const key = normalizeTag(tag);
             if (key in availableMap) {
                 mergedTags.push(availableMap[key]);
             }
         }
+    } else if (selectedCategories.length) {
+        for (const category of selectedCategories) {
+            mergedTags.push(...(state.categories[category] || []));
+        }
+    } else if (useAllWhenEmpty) {
+        mergedTags = [...allTags];
     }
 
     if (deduplicateSelected && mergedTags.length) {
@@ -920,6 +1042,37 @@ function syncSelectedWidget(node, markDirty = true) {
     }
 }
 
+function syncSelectedCategoriesWidget(node, markDirty = true) {
+    const state = node.__dtsState;
+    if (!state?.selectedCategoriesWidget) return;
+
+    const explicitCategories = getExplicitSelectedCategories(state);
+    const explicitSet = new Set(explicitCategories.map(normalizeCategory));
+    const ordered = [];
+    const seen = new Set();
+
+    for (const category of state.categoryOrder || []) {
+        const key = normalizeCategory(category);
+        if (!explicitSet.has(key) || seen.has(key)) continue;
+        seen.add(key);
+        ordered.push(category);
+    }
+    for (const category of explicitCategories) {
+        const key = normalizeCategory(category);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        ordered.push(category);
+    }
+
+    state.selectedCategories = [...ordered];
+    setWidgetValue(state.selectedCategoriesWidget, JSON.stringify(ordered));
+
+    if (markDirty) {
+        node.setDirtyCanvas(true, true);
+        app.graph?.setDirtyCanvas?.(true, true);
+    }
+}
+
 function pruneSelectionByAvailability(state) {
     const available = new Set();
     for (const tags of Object.values(state.categories)) {
@@ -928,7 +1081,28 @@ function pruneSelectionByAvailability(state) {
     state.selected = state.selected.filter(tag => available.has(normalizeTag(tag)));
 }
 
-function scheduleRefresh(node, delay = 260) {
+function pruneCategorySelectionByAvailability(state) {
+    const lookup = {};
+    for (const category of Object.keys(state.categories || {})) {
+        const key = normalizeCategory(category);
+        if (!(key in lookup)) {
+            lookup[key] = category;
+        }
+    }
+
+    const next = [];
+    const seen = new Set();
+    for (const category of state.selectedCategories || []) {
+        const key = normalizeCategory(category);
+        const resolved = lookup[key];
+        if (!resolved || seen.has(key)) continue;
+        seen.add(key);
+        next.push(resolved);
+    }
+    state.selectedCategories = next;
+}
+
+function scheduleRefresh(node, delay = 420) {
     const state = node.__dtsState;
     if (!state) return;
     clearTimeout(state.refreshTimer);
@@ -989,12 +1163,19 @@ function getFilteredCategories(state) {
         if (state.categoryFilter !== "__all" && category !== state.categoryFilter) continue;
 
         const categoryHit = category.toLowerCase().includes(search);
-        const finalTags = search
-            ? (categoryHit ? tags : tags.filter(tag => tag.toLowerCase().includes(search)))
-            : tags;
+        if (!search) {
+            filtered[category] = tags;
+            continue;
+        }
 
-        if (finalTags.length) {
-            filtered[category] = finalTags;
+        if (categoryHit) {
+            filtered[category] = tags;
+            continue;
+        }
+
+        const matchedTags = tags.filter(tag => tag.toLowerCase().includes(search));
+        if (matchedTags.length) {
+            filtered[category] = matchedTags;
         }
     }
     return filtered;
@@ -1038,26 +1219,43 @@ function clearVisibleTags(node) {
     renderAll(node);
 }
 
+async function fetchJsonOrThrow(url, options = undefined) {
+    const response = await api.fetchApi(url, options);
+    if (!response.ok) {
+        let detail = "";
+        try {
+            const errPayload = await response.json();
+            detail = String(errPayload?.message || "");
+        } catch {
+            // ignore parse failures and keep status code only
+        }
+        throw new Error(detail ? `HTTP ${response.status}: ${detail}` : `HTTP ${response.status}`);
+    }
+    return response.json();
+}
+
 async function refreshCategories(node) {
     const state = node.__dtsState;
     if (!state) return;
+    const requestId = (state.refreshRequestId || 0) + 1;
+    state.refreshRequestId = requestId;
 
     const previewInfo = getPreviewTagsText(node);
-    const usePreview = state.isIntegrated && previewInfo.previewText.length > 0;
+    const usePreview = state.isIntegrated;
 
     setStatus(
         node,
         state.isIntegrated
-            ? (usePreview ? "status_previewing_current" : "status_loading_last")
+            ? "status_previewing_current"
             : "status_loading_latest"
     );
 
     try {
-        let response;
-        let source = "latest";
+        let source = usePreview ? "preview" : "latest";
+        let payload;
 
         if (usePreview) {
-            const payload = {
+            const previewPayload = {
                 node_id: String(node.id),
                 tags: previewInfo.previewText,
                 excel_file: String(getWidgetValue(node, "excel_file", "danbooru_tags.xlsx")),
@@ -1072,49 +1270,73 @@ async function refreshCategories(node) {
                 is_comment: normalizeBooleanValue(getWidgetValue(node, "is_comment", true), true),
             };
 
-            response = await api.fetchApi("/danbooru_tag_picker/preview", {
+            const previewData = await fetchJsonOrThrow("/danbooru_tag_picker/preview", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payload),
+                body: JSON.stringify(previewPayload),
             });
-            source = "preview";
+
+            const mergedCategories = normalizeCategories(previewData.categories || {});
+
+            // 输入 tags 为空（例如 WD14 连线场景）时，优先保留分类骨架，再尝试用最新缓存填充真实 tags。
+            if (!previewInfo.previewText.length) {
+                try {
+                    const latestData = await fetchJsonOrThrow(
+                        `/danbooru_tag_picker/latest?node_id=${encodeURIComponent(String(node.id))}`,
+                        { cache: "no-store" }
+                    );
+                    const latestCategories = normalizeCategories(latestData.categories || {});
+                    if (Object.keys(latestCategories).length > 0) {
+                        const skeletonLookup = {};
+                        for (const category of Object.keys(mergedCategories)) {
+                            const key = normalizeCategory(category);
+                            if (!(key in skeletonLookup)) {
+                                skeletonLookup[key] = category;
+                            }
+                        }
+
+                        let hasFilledAny = false;
+                        for (const [category, tags] of Object.entries(latestCategories)) {
+                            const key = normalizeCategory(category);
+                            const targetCategory = skeletonLookup[key];
+                            if (!targetCategory) continue;
+                            mergedCategories[targetCategory] = Array.isArray(tags) ? tags : [];
+                            hasFilledAny = true;
+                        }
+                        if (hasFilledAny) {
+                            source = "latest";
+                        }
+                    }
+                } catch {
+                    // ignore latest-fallback failure and keep preview skeleton
+                }
+            }
+
+            payload = { ...previewData, categories: mergedCategories };
         } else {
-            response = await api.fetchApi(
+            payload = await fetchJsonOrThrow(
                 `/danbooru_tag_picker/latest?node_id=${encodeURIComponent(String(node.id))}`,
                 { cache: "no-store" }
             );
         }
-
-        if (!response.ok) {
-            let detail = "";
-            try {
-                const errPayload = await response.json();
-                detail = String(errPayload?.message || "");
-            } catch {
-                // ignore parse failures and keep status code only
-            }
-            throw new Error(detail ? `HTTP ${response.status}: ${detail}` : `HTTP ${response.status}`);
-        }
-
-        const payload = await response.json();
+        if (requestId !== state.refreshRequestId) return;
         state.categories = normalizeCategories(payload.categories || {});
 
         pruneSelectionByAvailability(state);
+        pruneCategorySelectionByAvailability(state);
         updateCategoryOrderFromSelection(state);
         syncSelectedWidget(node, false);
+        syncSelectedCategoriesWidget(node, false);
 
         const count = Object.keys(state.categories).length;
         const statusKey = count > 0
             ? (source === "preview" ? "status_loaded_preview" : "status_loaded_last")
-            : state.isIntegrated
-                ? (usePreview
-                    ? "status_no_preview"
-                    : "status_no_cached")
-                : "status_no_data";
+            : (state.isIntegrated ? "status_no_preview" : "status_no_data");
         setStatus(node, statusKey, { count });
 
         renderAll(node);
     } catch (error) {
+        if (requestId !== state.refreshRequestId) return;
         setStatus(node, "status_failed");
         console.error("[DanbooruTagToolkit] refresh failed:", error);
     }
@@ -1131,6 +1353,23 @@ function toggleTag(node, tag) {
 
     updateCategoryOrderFromSelection(state);
     syncSelectedWidget(node);
+    renderAll(node);
+}
+
+function toggleCategory(node, category) {
+    const state = node.__dtsState;
+    if (!state) return;
+
+    const key = normalizeCategory(category);
+    const idx = (state.selectedCategories || []).findIndex(c => normalizeCategory(c) === key);
+    if (idx >= 0) {
+        state.selectedCategories.splice(idx, 1);
+    } else {
+        state.selectedCategories.push(category);
+    }
+
+    updateCategoryOrderFromSelection(state);
+    syncSelectedCategoriesWidget(node);
     renderAll(node);
 }
 
@@ -1165,7 +1404,18 @@ function clearCategory(node, category) {
 }
 
 function removeSelectedCategory(node, category) {
-    clearCategory(node, category);
+    const state = node.__dtsState;
+    if (!state) return;
+
+    const removeSet = new Set((state.categories[category] || []).map(normalizeTag));
+    state.selected = state.selected.filter(tag => !removeSet.has(normalizeTag(tag)));
+    state.selectedCategories = (state.selectedCategories || [])
+        .filter(cat => normalizeCategory(cat) !== normalizeCategory(category));
+
+    updateCategoryOrderFromSelection(state);
+    syncSelectedWidget(node, false);
+    syncSelectedCategoriesWidget(node);
+    renderAll(node);
 }
 
 function moveCategoryOrder(state, from, to) {
@@ -1223,10 +1473,14 @@ function renderCategories(node) {
     }
 
     const selectedSet = new Set(state.selected.map(normalizeTag));
+    const selectedCategorySet = new Set((state.selectedCategories || []).map(normalizeCategory));
 
     for (const category of names) {
         const card = document.createElement("div");
         card.className = "dts-category";
+        if (selectedCategorySet.has(normalizeCategory(category))) {
+            card.classList.add("dts-category-selected");
+        }
 
         const head = document.createElement("div");
         head.className = "dts-category-head";
@@ -1238,6 +1492,13 @@ function renderCategories(node) {
         const actions = document.createElement("div");
         actions.className = "dts-small-actions";
 
+        const categoryBtn = document.createElement("button");
+        categoryBtn.className = "dts-small";
+        categoryBtn.textContent = selectedCategorySet.has(normalizeCategory(category))
+            ? tr(state, "btn_unpick_category")
+            : tr(state, "btn_pick_category");
+        categoryBtn.onclick = () => toggleCategory(node, category);
+
         const allBtn = document.createElement("button");
         allBtn.className = "dts-small";
         allBtn.textContent = tr(state, "btn_all");
@@ -1248,6 +1509,7 @@ function renderCategories(node) {
         noneBtn.textContent = tr(state, "btn_none");
         noneBtn.onclick = () => clearCategory(node, category);
 
+        actions.appendChild(categoryBtn);
         actions.appendChild(allBtn);
         actions.appendChild(noneBtn);
 
@@ -1277,7 +1539,7 @@ function renderSelected(node) {
     list.innerHTML = "";
 
     const byCategory = getSelectedByCategory(state);
-    const activeCategories = (state.categoryOrder || []).filter(cat => (byCategory[cat] || []).length > 0);
+    const activeCategories = getActiveSelectedCategories(state);
 
     if (!activeCategories.length) {
         const empty = document.createElement("div");
@@ -1310,7 +1572,7 @@ function renderSelected(node) {
 
         const rowText = document.createElement("div");
         rowText.className = "dts-selected-line";
-        rowText.textContent = tags.join(", ");
+        rowText.textContent = tags.length ? tags.join(", ") : tr(state, "empty_selected_line");
 
         body.appendChild(rowTitle);
         body.appendChild(rowText);
@@ -1325,7 +1587,8 @@ function renderSelected(node) {
         upBtn.onclick = () => {
             if (index <= 0) return;
             moveCategoryOrder(state, index, index - 1);
-            syncSelectedWidget(node);
+            syncSelectedWidget(node, false);
+            syncSelectedCategoriesWidget(node);
             renderAll(node);
         };
 
@@ -1336,7 +1599,8 @@ function renderSelected(node) {
         downBtn.onclick = () => {
             if (index >= activeCategories.length - 1) return;
             moveCategoryOrder(state, index, index + 1);
-            syncSelectedWidget(node);
+            syncSelectedWidget(node, false);
+            syncSelectedCategoriesWidget(node);
             renderAll(node);
         };
 
@@ -1379,7 +1643,8 @@ function renderSelected(node) {
             const to = index;
             if (from == null || from === to) return;
             moveCategoryOrder(state, from, to);
-            syncSelectedWidget(node);
+            syncSelectedWidget(node, false);
+            syncSelectedCategoriesWidget(node);
             renderAll(node);
         });
 
@@ -1394,11 +1659,12 @@ function renderPreview(node) {
     const state = node.__dtsState;
     const orderedTags = getOrderedSelectedTags(state);
     const outputTags = getOutputTagsForPreview(node);
+    const activeCategories = getActiveSelectedCategories(state);
     state.previewEl.textContent = buildPreview(node) || tr(state, "empty_preview");
     state.metaEl.textContent = tr(state, "meta_line", {
         output: outputTags.length,
         selected: orderedTags.length,
-        categories: (state.categoryOrder || []).length,
+        categories: activeCategories.length,
     });
 }
 
@@ -1413,6 +1679,7 @@ function applyLanguage(node, rerender = true) {
     if (!state) return;
 
     const refs = state.i18nRefs || {};
+    const srefs = state.settingsI18nRefs || {};
 
     if (refs.titleEl) {
         refs.titleEl.textContent = state.isIntegrated ? tr(state, "title_integrated") : tr(state, "title_selector");
@@ -1447,12 +1714,55 @@ function applyLanguage(node, rerender = true) {
             : tr(state, "status_ready");
     }
 
+    if (srefs.title) srefs.title.textContent = tr(state, "settings_title");
+    if (srefs.sorterTitle) srefs.sorterTitle.textContent = tr(state, "settings_sorter");
+    if (srefs.outputTitle) srefs.outputTitle.textContent = tr(state, "settings_output");
+    if (srefs.excelLabel) srefs.excelLabel.textContent = tr(state, "settings_excel");
+    if (srefs.mappingLabel) srefs.mappingLabel.textContent = tr(state, "settings_mapping");
+    if (srefs.orderLabel) srefs.orderLabel.textContent = tr(state, "settings_order");
+    if (srefs.defaultLabel) srefs.defaultLabel.textContent = tr(state, "settings_default_category");
+    if (srefs.regexLabel) srefs.regexLabel.textContent = tr(state, "settings_regex_blacklist");
+    if (srefs.blacklistLabel) srefs.blacklistLabel.textContent = tr(state, "settings_tag_blacklist");
+    if (srefs.dedupTagsLabel) srefs.dedupTagsLabel.textContent = tr(state, "settings_dedup_before_sort");
+    if (srefs.validationLabel) srefs.validationLabel.textContent = tr(state, "settings_validation");
+    if (srefs.reloadLabel) srefs.reloadLabel.textContent = tr(state, "settings_reload");
+    if (srefs.commentLabel) srefs.commentLabel.textContent = tr(state, "settings_comment");
+    if (srefs.prefixLabel) srefs.prefixLabel.textContent = tr(state, "settings_prefix");
+    if (srefs.separatorLabel) srefs.separatorLabel.textContent = tr(state, "settings_separator");
+    if (srefs.useAllLabel) srefs.useAllLabel.textContent = tr(state, "settings_use_all_empty");
+    if (srefs.dedupeLabel) srefs.dedupeLabel.textContent = tr(state, "settings_dedup_selected");
+    if (srefs.trailingLabel) srefs.trailingLabel.textContent = tr(state, "settings_keep_trailing");
+    if (srefs.sepButtons?.comma) srefs.sepButtons.comma.textContent = tr(state, "settings_sep_comma");
+    if (srefs.sepButtons?.newline) srefs.sepButtons.newline.textContent = tr(state, "settings_sep_newline");
+    if (srefs.sepButtons?.space) srefs.sepButtons.space.textContent = tr(state, "settings_sep_space");
+
     if (rerender) {
         renderAll(node);
     }
 }
 function bindTextInput(input, widget, onChange) {
-    input.addEventListener("input", () => {
+    let isComposing = false;
+
+    input.addEventListener("compositionstart", () => {
+        isComposing = true;
+    });
+
+    input.addEventListener("compositionend", () => {
+        isComposing = false;
+        setWidgetValue(widget, input.value ?? "");
+        if (onChange) onChange();
+    });
+
+    input.addEventListener("input", event => {
+        if (isComposing || event?.isComposing) {
+            return;
+        }
+        setWidgetValue(widget, input.value ?? "");
+        if (onChange) onChange();
+    });
+
+    input.addEventListener("change", () => {
+        if (isComposing) return;
         setWidgetValue(widget, input.value ?? "");
         if (onChange) onChange();
     });
@@ -1480,17 +1790,19 @@ function createInputField(labelText, type = "text") {
 
     field.appendChild(label);
     field.appendChild(input);
-    return { field, input };
+    return { field, input, label };
 }
 
 function createToggleRow(labelText) {
     const row = document.createElement("label");
     row.className = "dts-toggle";
-    row.innerHTML = `<span>${labelText}</span>`;
+    const text = document.createElement("span");
+    text.textContent = labelText;
     const input = document.createElement("input");
     input.type = "checkbox";
+    row.appendChild(text);
     row.appendChild(input);
-    return { row, input };
+    return { row, input, text };
 }
 
 function createSettingsPanel(node) {
@@ -1500,27 +1812,27 @@ function createSettingsPanel(node) {
 
     const title = document.createElement("div");
     title.className = "dts-settings-title";
-    title.textContent = "Node Settings";
+    title.textContent = tr(state, "settings_title");
     panel.appendChild(title);
 
     const sorterSection = document.createElement("div");
     sorterSection.className = "dts-section";
     const sorterTitle = document.createElement("div");
     sorterTitle.className = "dts-section-title";
-    sorterTitle.textContent = "Sorter";
+    sorterTitle.textContent = tr(state, "settings_sorter");
     sorterSection.appendChild(sorterTitle);
 
-    const excelField = createInputField("Excel / CSV file");
-    const mapField = createInputField("Category mapping", "textarea");
-    const orderField = createInputField("Category order", "textarea");
-    const defaultField = createInputField("Default category");
-    const regexField = createInputField("Regex blacklist");
-    const tagBlacklistField = createInputField("Tag blacklist", "textarea");
+    const excelField = createInputField(tr(state, "settings_excel"));
+    const mapField = createInputField(tr(state, "settings_mapping"), "textarea");
+    const orderField = createInputField(tr(state, "settings_order"), "textarea");
+    const defaultField = createInputField(tr(state, "settings_default_category"));
+    const regexField = createInputField(tr(state, "settings_regex_blacklist"));
+    const tagBlacklistField = createInputField(tr(state, "settings_tag_blacklist"), "textarea");
 
-    const dedupTagsRow = createToggleRow("Deduplicate tags before sort");
-    const validationRow = createToggleRow("Validate category mapping");
-    const reloadRow = createToggleRow("Force reload database");
-    const commentRow = createToggleRow("Keep category comments");
+    const dedupTagsRow = createToggleRow(tr(state, "settings_dedup_before_sort"));
+    const validationRow = createToggleRow(tr(state, "settings_validation"));
+    const reloadRow = createToggleRow(tr(state, "settings_reload"));
+    const commentRow = createToggleRow(tr(state, "settings_comment"));
 
     sorterSection.appendChild(excelField.field);
     sorterSection.appendChild(mapField.field);
@@ -1537,25 +1849,25 @@ function createSettingsPanel(node) {
     outputSection.className = "dts-section";
     const outputTitle = document.createElement("div");
     outputTitle.className = "dts-section-title";
-    outputTitle.textContent = "Output";
+    outputTitle.textContent = tr(state, "settings_output");
     outputSection.appendChild(outputTitle);
 
-    const prefixField = createInputField("Prefix text", "textarea");
+    const prefixField = createInputField(tr(state, "settings_prefix"), "textarea");
     outputSection.appendChild(prefixField.field);
 
     const sepField = document.createElement("div");
     sepField.className = "dts-field";
     const sepLabel = document.createElement("label");
-    sepLabel.textContent = "Separator";
+    sepLabel.textContent = tr(state, "settings_separator");
     const sepSegment = document.createElement("div");
     sepSegment.className = "dts-segment";
-    const sepButtons = [];
+    const sepButtons = {};
 
-    [["comma", "Comma"], ["newline", "Newline"], ["space", "Space"]].forEach(([value, label]) => {
+    [["comma", "settings_sep_comma"], ["newline", "settings_sep_newline"], ["space", "settings_sep_space"]].forEach(([value, labelKey]) => {
         const btn = document.createElement("button");
         btn.className = "dts-seg";
         btn.dataset.value = value;
-        btn.textContent = label;
+        btn.textContent = tr(state, labelKey);
         btn.onclick = () => {
             setWidgetValue(state.separatorWidget, value);
             node.setDirtyCanvas(true, true);
@@ -1563,16 +1875,16 @@ function createSettingsPanel(node) {
             syncSettingsFromWidgets(node);
             renderPreview(node);
         };
-        sepButtons.push(btn);
+        sepButtons[value] = btn;
         sepSegment.appendChild(btn);
     });
 
     sepField.appendChild(sepLabel);
     sepField.appendChild(sepSegment);
 
-    const useAllRow = createToggleRow("Use all when none selected");
-    const dedupeRow = createToggleRow("Deduplicate selected tags");
-    const trailingRow = createToggleRow("Keep trailing separator");
+    const useAllRow = createToggleRow(tr(state, "settings_use_all_empty"));
+    const dedupeRow = createToggleRow(tr(state, "settings_dedup_selected"));
+    const trailingRow = createToggleRow(tr(state, "settings_keep_trailing"));
 
     outputSection.appendChild(sepField);
     outputSection.appendChild(useAllRow.row);
@@ -1585,53 +1897,53 @@ function createSettingsPanel(node) {
     bindTextInput(excelField.input, state.excelWidget, () => {
         node.setDirtyCanvas(true, true);
         app.graph?.setDirtyCanvas?.(true, true);
-        if (state.isIntegrated) scheduleRefresh(node);
+        if (state.isIntegrated) scheduleRefresh(node, 500);
     });
     bindTextInput(mapField.input, state.mappingWidget, () => {
         node.setDirtyCanvas(true, true);
         app.graph?.setDirtyCanvas?.(true, true);
-        if (state.isIntegrated) scheduleRefresh(node);
+        if (state.isIntegrated) scheduleRefresh(node, 900);
     });
     bindTextInput(orderField.input, state.orderWidget, () => {
         node.setDirtyCanvas(true, true);
         app.graph?.setDirtyCanvas?.(true, true);
-        if (state.isIntegrated) scheduleRefresh(node);
+        if (state.isIntegrated) scheduleRefresh(node, 900);
     });
     bindTextInput(defaultField.input, state.defaultCategoryWidget, () => {
         node.setDirtyCanvas(true, true);
         app.graph?.setDirtyCanvas?.(true, true);
-        if (state.isIntegrated) scheduleRefresh(node);
+        if (state.isIntegrated) scheduleRefresh(node, 500);
     });
     bindTextInput(regexField.input, state.regexWidget, () => {
         node.setDirtyCanvas(true, true);
         app.graph?.setDirtyCanvas?.(true, true);
-        if (state.isIntegrated) scheduleRefresh(node);
+        if (state.isIntegrated) scheduleRefresh(node, 500);
     });
     bindTextInput(tagBlacklistField.input, state.tagBlacklistWidget, () => {
         node.setDirtyCanvas(true, true);
         app.graph?.setDirtyCanvas?.(true, true);
-        if (state.isIntegrated) scheduleRefresh(node);
+        if (state.isIntegrated) scheduleRefresh(node, 900);
     });
 
     bindBoolInput(dedupTagsRow.input, state.deduplicateTagsWidget, () => {
         node.setDirtyCanvas(true, true);
         app.graph?.setDirtyCanvas?.(true, true);
-        if (state.isIntegrated) scheduleRefresh(node);
+        if (state.isIntegrated) scheduleRefresh(node, 360);
     });
     bindBoolInput(validationRow.input, state.validationWidget, () => {
         node.setDirtyCanvas(true, true);
         app.graph?.setDirtyCanvas?.(true, true);
-        if (state.isIntegrated) scheduleRefresh(node);
+        if (state.isIntegrated) scheduleRefresh(node, 360);
     });
     bindBoolInput(reloadRow.input, state.forceReloadWidget, () => {
         node.setDirtyCanvas(true, true);
         app.graph?.setDirtyCanvas?.(true, true);
-        if (state.isIntegrated) scheduleRefresh(node);
+        if (state.isIntegrated) scheduleRefresh(node, 360);
     });
     bindBoolInput(commentRow.input, state.commentWidget, () => {
         node.setDirtyCanvas(true, true);
         app.graph?.setDirtyCanvas?.(true, true);
-        if (state.isIntegrated) scheduleRefresh(node);
+        if (state.isIntegrated) scheduleRefresh(node, 360);
     });
 
     bindTextInput(prefixField.input, state.prefixWidget, () => {
@@ -1673,6 +1985,28 @@ function createSettingsPanel(node) {
         trailingToggle: trailingRow.input,
     };
 
+    state.settingsI18nRefs = {
+        title,
+        sorterTitle,
+        outputTitle,
+        excelLabel: excelField.label,
+        mappingLabel: mapField.label,
+        orderLabel: orderField.label,
+        defaultLabel: defaultField.label,
+        regexLabel: regexField.label,
+        blacklistLabel: tagBlacklistField.label,
+        dedupTagsLabel: dedupTagsRow.text,
+        validationLabel: validationRow.text,
+        reloadLabel: reloadRow.text,
+        commentLabel: commentRow.text,
+        prefixLabel: prefixField.label,
+        separatorLabel: sepLabel,
+        sepButtons,
+        useAllLabel: useAllRow.text,
+        dedupeLabel: dedupeRow.text,
+        trailingLabel: trailingRow.text,
+    };
+
     return panel;
 }
 
@@ -1701,7 +2035,7 @@ function syncSettingsFromWidgets(node) {
     state.settingsControls.dedupeToggle.checked = normalizeBooleanValue(getWidgetValue(node, "deduplicate_selected", true), true);
     state.settingsControls.trailingToggle.checked = normalizeBooleanValue(getWidgetValue(node, "keep_trailing_comma", true), true);
 
-    state.settingsControls.sepButtons.forEach(btn => {
+    Object.values(state.settingsControls.sepButtons || {}).forEach(btn => {
         btn.classList.toggle("active", btn.dataset.value === separator);
     });
 }
@@ -1718,6 +2052,7 @@ app.registerExtension({
             injectStyle();
 
             const selectedWidget = getWidget(this, "selected_tags_json");
+            const selectedCategoriesWidget = getWidget(this, "selected_categories_json");
             const prefixWidget = getWidget(this, "prefix_text");
             const separatorWidget = getWidget(this, "separator");
             const useAllWidget = getWidget(this, "use_all_when_empty");
@@ -1738,7 +2073,7 @@ app.registerExtension({
 
             sanitizeLegacyWidgetValues(this);
 
-            [selectedWidget, prefixWidget, separatorWidget, useAllWidget, dedupeWidget, trailingWidget].forEach(hideWidget);
+            [selectedWidget, selectedCategoriesWidget, prefixWidget, separatorWidget, useAllWidget, dedupeWidget, trailingWidget].forEach(hideWidget);
             if (isIntegratedNode) {
                 [
                     excelWidget,
@@ -1910,6 +2245,7 @@ app.registerExtension({
                 viewMode: "split",
                 compact: false,
                 selectedWidget,
+                selectedCategoriesWidget,
                 prefixWidget,
                 separatorWidget,
                 useAllWidget,
@@ -1928,8 +2264,11 @@ app.registerExtension({
                 commentWidget,
                 categories: {},
                 selected: parseSelected(selectedWidget?.value),
+                selectedCategories: parseSelected(selectedCategoriesWidget?.value),
                 categoryOrder: [],
                 dragIndex: null,
+                refreshTimer: null,
+                refreshRequestId: 0,
                 settingsOpen: false,
                 searchText: "",
                 categoryFilter: "__all",
@@ -1976,8 +2315,10 @@ app.registerExtension({
             clearBtn.onclick = () => {
                 const state = this.__dtsState;
                 state.selected = [];
+                state.selectedCategories = [];
                 state.categoryOrder = [];
-                syncSelectedWidget(this);
+                syncSelectedWidget(this, false);
+                syncSelectedCategoriesWidget(this);
                 renderAll(this);
             };
 
@@ -2029,6 +2370,7 @@ app.registerExtension({
 
             sanitizeLegacyWidgetValues(this);
             state.selected = parseSelected(state.selectedWidget?.value);
+            state.selectedCategories = parseSelected(state.selectedCategoriesWidget?.value);
             syncSettingsFromWidgets(this);
             updateCategoryOrderFromSelection(state);
             syncRootLayout(this);
@@ -2045,6 +2387,7 @@ app.registerExtension({
 
             const settingsSet = new Set([
                 "selected_tags_json",
+                "selected_categories_json",
                 "prefix_text",
                 "separator",
                 "use_all_when_empty",
@@ -2067,8 +2410,16 @@ app.registerExtension({
                     state.selected = parseSelected(state.selectedWidget?.value);
                     updateCategoryOrderFromSelection(state);
                 }
+                if (widget.name === "selected_categories_json") {
+                    state.selectedCategories = parseSelected(state.selectedCategoriesWidget?.value);
+                    updateCategoryOrderFromSelection(state);
+                }
                 syncSettingsFromWidgets(this);
-                renderPreview(this);
+                if (widget.name === "selected_tags_json" || widget.name === "selected_categories_json") {
+                    renderAll(this);
+                } else {
+                    renderPreview(this);
+                }
 
                 if (state.isIntegrated && [
                     "excel_file",
@@ -2082,13 +2433,14 @@ app.registerExtension({
                     "force_reload",
                     "is_comment",
                 ].includes(widget.name)) {
-                    scheduleRefresh(this);
+                    const slowSet = new Set(["category_mapping", "new_category_order", "tag_blacklist"]);
+                    scheduleRefresh(this, slowSet.has(widget.name) ? 900 : 500);
                 }
                 return result;
             }
 
             if (state.isIntegrated && widget?.name === "tags") {
-                scheduleRefresh(this);
+                scheduleRefresh(this, 500);
             }
 
             return result;
