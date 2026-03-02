@@ -123,16 +123,20 @@ function injectStyle() {
         }
         .dtg-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+            grid-template-columns: repeat(2, minmax(0, 1fr));
             gap: 8px;
+            grid-auto-rows: 1px;
             align-content: start;
-            overflow: auto;
+            overflow-y: scroll;
+            overflow-x: hidden;
+            scrollbar-gutter: stable;
             padding-right: 2px;
             min-height: 0;
             height: 100%;
         }
         .dtg-card {
             position: relative;
+            display: block;
             border: 1px solid #343434;
             border-radius: 8px;
             background: #121212;
@@ -176,12 +180,11 @@ function injectStyle() {
             width: 100%;
             overflow: hidden;
             background: #0b0b0b;
-            aspect-ratio: 1;
+            display: block;
         }
         .dtg-thumb {
             width: 100%;
-            height: 100%;
-            object-fit: cover;
+            height: auto;
             display: block;
         }
         .dtg-meta {
@@ -432,6 +435,7 @@ function normalizePost(raw) {
         md5: String(post.md5 ?? ""),
         preview_url: String(post.preview_url ?? ""),
         image_url: String(post.image_url ?? ""),
+        display_url: String(post.display_url ?? ""),
         preview_width: Number(post.preview_width ?? 0),
         preview_height: Number(post.preview_height ?? 0),
         image_width: Number(post.image_width ?? 0),
@@ -578,7 +582,7 @@ app.registerExtension({
 
             const statusEl = document.createElement("div");
             statusEl.className = "dtg-status";
-            statusEl.textContent = "Enter tags and click Load. (build hf3)";
+            statusEl.textContent = "Enter tags and click Load. (build hf8)";
 
             const content = document.createElement("div");
             content.className = "dtg-content";
@@ -659,6 +663,7 @@ app.registerExtension({
             const originalOnResize = this.onResize;
             const syncGridLayout = (size = this.size) => {
                 const nodeHeight = Math.max(360, Number(Array.isArray(size) ? size[1] : this.size?.[1]) || 760);
+                const nodeWidth = Math.max(360, Number(Array.isArray(size) ? size[0] : this.size?.[0]) || 720);
                 const rootStyle = window.getComputedStyle(root);
                 const paddingTop = parseFloat(rootStyle.paddingTop || "0");
                 const paddingBottom = parseFloat(rootStyle.paddingBottom || "0");
@@ -677,6 +682,16 @@ app.registerExtension({
                 if (uiWidget?.element) {
                     uiWidget.element.style.height = `${Math.max(320, nodeHeight - 46)}px`;
                 }
+
+                const narrow = nodeWidth <= 980;
+                const sidebarWidth = narrow ? 0 : 230;
+                const contentGap = 10;
+                const gridWidth = Math.max(180, nodeWidth - 30 - sidebarWidth - (narrow ? 0 : contentGap));
+                const minCardWidth = 260;
+                const maxColumns = narrow ? 2 : 3;
+                const columns = Math.max(1, Math.min(maxColumns, Math.floor(gridWidth / minCardWidth) || 1));
+                grid.style.gridTemplateColumns = `repeat(${columns}, minmax(0, 1fr))`;
+                requestAnimationFrame(() => resizeAllMasonryCards());
             };
             this.onResize = size => {
                 originalOnResize?.call(this, size);
@@ -832,7 +847,7 @@ app.registerExtension({
                     const thumb = document.createElement("img");
                     thumb.className = "dtg-picked-thumb";
                     thumb.loading = "lazy";
-                    thumb.src = String(item?.preview_url || item?.image_url || "");
+                    thumb.src = String(item?.display_url || item?.preview_url || item?.image_url || "");
                     thumb.alt = postId || "selected";
 
                     const meta = document.createElement("div");
@@ -848,7 +863,7 @@ app.registerExtension({
 
                     const removeBtn = document.createElement("button");
                     removeBtn.className = "dtg-picked-remove";
-                    removeBtn.textContent = "×";
+                    removeBtn.textContent = "x";
                     removeBtn.title = "Remove";
                     removeBtn.onclick = event => {
                         event.preventDefault();
@@ -872,26 +887,41 @@ app.registerExtension({
                 updateSummary();
             }
 
-            function getPostAspectRatio(post) {
-                const width = Number(post?.preview_width || post?.image_width || 0);
-                const height = Number(post?.preview_height || post?.image_height || 0);
-                if (width > 0 && height > 0) {
-                    const ratio = width / height;
-                    return Math.max(0.42, Math.min(2.6, ratio));
-                }
-                return 1;
+            function resizeMasonryCard(card) {
+                if (!card) return;
+                const gridStyle = window.getComputedStyle(state.grid);
+                const rowGap =
+                    Number.parseInt(gridStyle.getPropertyValue("row-gap"), 10) ||
+                    Number.parseInt(gridStyle.getPropertyValue("grid-row-gap"), 10) ||
+                    8;
+                const rowHeight = Number.parseInt(gridStyle.getPropertyValue("grid-auto-rows"), 10) || 1;
+                const img = card.querySelector(".dtg-thumb");
+                const meta = card.querySelector(".dtg-meta");
+                const imgHeight = img?.getBoundingClientRect?.().height || img?.clientHeight || 0;
+                const metaHeight = meta?.getBoundingClientRect?.().height || meta?.clientHeight || 0;
+                const total = Math.ceil(imgHeight + metaHeight + 2);
+                if (total <= 0) return;
+                const span = Math.max(1, Math.ceil((total + rowGap) / (rowHeight + rowGap)));
+                card.style.gridRowEnd = `span ${span}`;
+            }
+
+            function resizeAllMasonryCards() {
+                state.grid.querySelectorAll(".dtg-card").forEach(card => resizeMasonryCard(card));
             }
 
             function renderPosts() {
                 state.grid.innerHTML = "";
                 if (!state.posts.length) {
+                    state.grid.style.gridAutoRows = "auto";
                     const empty = document.createElement("div");
                     empty.className = "dtg-empty";
                     empty.textContent = "No posts loaded.";
+                    empty.style.gridColumn = "1 / -1";
                     state.grid.appendChild(empty);
                     updateSummary();
                     return;
                 }
+                state.grid.style.gridAutoRows = "1px";
 
                 const selectedCategories = getSelectedCategories();
                 state.posts.forEach(post => {
@@ -903,22 +933,22 @@ app.registerExtension({
 
                     const img = document.createElement("img");
                     img.className = "dtg-thumb";
-                    img.src = post.preview_url || "";
+                    const primaryThumbUrl = post.display_url || post.preview_url || "";
+                    const fallbackThumbUrl = post.preview_url || "";
+                    img.src = primaryThumbUrl;
                     img.alt = String(post.id || "");
                     img.loading = "lazy";
+                    img.onload = () => {
+                        resizeMasonryCard(card);
+                    };
                     const thumbWrap = document.createElement("div");
                     thumbWrap.className = "dtg-thumb-wrap";
-                    thumbWrap.style.aspectRatio = String(getPostAspectRatio(post));
-                    img.onload = () => {
-                        const width = Number(post?.preview_width || post?.image_width || 0);
-                        const height = Number(post?.preview_height || post?.image_height || 0);
-                        if (width > 0 && height > 0) return;
-                        if (img.naturalWidth > 0 && img.naturalHeight > 0) {
-                            const ratio = Math.max(0.42, Math.min(2.6, img.naturalWidth / img.naturalHeight));
-                            thumbWrap.style.aspectRatio = String(ratio);
-                        }
-                    };
                     img.onerror = () => {
+                        if (img.dataset.fallbackTried !== "1" && fallbackThumbUrl && fallbackThumbUrl !== primaryThumbUrl) {
+                            img.dataset.fallbackTried = "1";
+                            img.src = fallbackThumbUrl;
+                            return;
+                        }
                         state.posts = state.posts.filter(p => p.id !== post.id);
                         if (state.selectedMap.has(post.id)) {
                             state.selectedMap.delete(post.id);
@@ -944,13 +974,13 @@ app.registerExtension({
                     card.appendChild(meta);
                     card.title = buildPromptLikeReference(post, selectedCategories) || post.prompt || "(empty prompt)";
 
-                    card.onclick = event => {
-                        const isMultiSelect = !!(event?.ctrlKey || event?.metaKey || event?.shiftKey);
+                    card.onclick = () => {
                         const alreadySelected = state.selectedMap.has(post.id);
                         const prompt = buildPromptLikeReference(post, getSelectedCategories());
                         const payload = {
                             post_id: post.id,
                             image_url: post.image_url || post.preview_url || "",
+                            display_url: post.display_url || post.preview_url || post.image_url || "",
                             preview_url: post.preview_url || "",
                             tag_string: post.tag_string || "",
                             tag_string_artist: post.tag_string_artist || "",
@@ -961,19 +991,6 @@ app.registerExtension({
                             prompt,
                         };
 
-                        // 默认普通点击：永远只保留当前这1张，避免历史多选残留影响输出。
-                        if (!isMultiSelect) {
-                            state.selectedMap.clear();
-                            state.grid.querySelectorAll(".dtg-card.selected").forEach(el => {
-                                el.classList.remove("selected");
-                            });
-                            state.selectedMap.set(post.id, payload);
-                            card.classList.add("selected");
-                            saveSelection();
-                            return;
-                        }
-
-                        // Ctrl/Meta/Shift 点击：多选模式，可增删。
                         if (alreadySelected) {
                             state.selectedMap.delete(post.id);
                             card.classList.remove("selected");
@@ -985,8 +1002,10 @@ app.registerExtension({
                     };
 
                     state.grid.appendChild(card);
+                    requestAnimationFrame(() => resizeMasonryCard(card));
                 });
 
+                requestAnimationFrame(() => resizeAllMasonryCards());
                 updateSummary();
                 if (state.pendingScrollTop > 0) {
                     requestAnimationFrame(() => {
@@ -1031,7 +1050,7 @@ app.registerExtension({
                     const dedup = new Map();
                     posts
                         .map(normalizePost)
-                        .filter(p => p.id && p.preview_url)
+                        .filter(p => p.id && (p.display_url || p.preview_url || p.image_url))
                         .forEach(p => {
                             if (!dedup.has(p.id)) {
                                 dedup.set(p.id, p);
@@ -1101,7 +1120,7 @@ app.registerExtension({
             const restoredDedup = new Map();
             restoredPosts
                 .map(normalizePost)
-                .filter(p => p.id && p.preview_url)
+                .filter(p => p.id && (p.display_url || p.preview_url || p.image_url))
                 .forEach(p => {
                     if (!restoredDedup.has(p.id)) {
                         restoredDedup.set(p.id, p);
@@ -1208,7 +1227,7 @@ app.registerExtension({
             const dedup = new Map();
             restoredPosts
                 .map(normalizePost)
-                .filter(p => p.id && p.preview_url)
+                .filter(p => p.id && (p.display_url || p.preview_url || p.image_url))
                 .forEach(p => {
                     if (!dedup.has(p.id)) {
                         dedup.set(p.id, p);

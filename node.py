@@ -621,6 +621,7 @@ def _fetch_gallery_posts(tags: str, limit: int, page: int, rating: str = "all") 
             "id": post_id,
             "preview_url": preview_url,
             "image_url": image_url,
+            "display_url": _absolutize_danbooru_url(item.get("large_file_url")) or preview_url,
             "preview_width": int(item.get("preview_width", 0) or 0),
             "preview_height": int(item.get("preview_height", 0) or 0),
             "image_width": int(item.get("image_width", 0) or 0),
