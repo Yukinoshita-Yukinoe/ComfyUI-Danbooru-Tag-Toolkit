@@ -164,6 +164,19 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
+def _unescape_comfy_parentheses(text: Any) -> str:
+    value = str(text or "")
+    return value.replace("\\(", "(").replace("\\)", ")")
+
+
+def _escape_unescaped_parentheses(text: Any) -> str:
+    value = str(text or "")
+    # only escape bare parentheses, keep already escaped ones as-is
+    value = re.sub(r'(?<!\\)\(', r'\\(', value)
+    value = re.sub(r'(?<!\\)\)', r'\\)', value)
+    return value
+
+
 def _extract_tags_text_from_payload(raw_value: Any, depth: int = 0) -> str:
     if depth > 3:
         return ""
@@ -215,18 +228,6 @@ def _extract_tags_text_from_payload(raw_value: Any, depth: int = 0) -> str:
 
         selections = raw_value.get("selections")
         if isinstance(selections, list):
-            # 兼容 Gallery payload：selections 里如果是图片选择项，默认只取最后一个，
-            # 避免把整页历史选择合并成一大串标签。
-            gallery_like = all(
-                isinstance(item, dict) and any(k in item for k in ("post_id", "image_url", "preview_url"))
-                for item in selections
-            ) if selections else False
-            if gallery_like:
-                for item in reversed(selections):
-                    extracted = _extract_tags_text_from_payload(item, depth + 1)
-                    if extracted:
-                        return extracted
-
             chunks: List[str] = []
             for item in selections:
                 extracted = _extract_tags_text_from_payload(item, depth + 1)
@@ -594,9 +595,13 @@ def _select_from_bundle(
     if selected_list:
         merged_tags = []
         for item in selected_list:
-            normalized_item = str(item).strip().lower()
+            normalized_item = _unescape_comfy_parentheses(item).strip().lower()
             if normalized_item in available_map:
                 merged_tags.append(available_map[normalized_item])
+            else:
+                fallback_tag = _escape_unescaped_parentheses(str(item).strip())
+                if fallback_tag:
+                    merged_tags.append(fallback_tag)
     elif resolved_categories:
         merged_tags = []
         for category in resolved_categories:
@@ -606,11 +611,18 @@ def _select_from_bundle(
     else:
         merged_tags = []
 
+    if merged_tags:
+        merged_tags = [
+            _escape_unescaped_parentheses(str(tag).strip())
+            for tag in merged_tags
+            if str(tag).strip()
+        ]
+
     if deduplicate_selected and merged_tags:
         seen = set()
         deduplicated = []
         for tag in merged_tags:
-            key = tag.lower()
+            key = _unescape_comfy_parentheses(tag).lower()
             if key in seen:
                 continue
             seen.add(key)
@@ -655,7 +667,7 @@ def _tag_string_to_prompt(tag_string: Any) -> str:
     tokens = [t.strip() for t in str(tag_string or "").split(" ") if t.strip()]
     if not tokens:
         return ""
-    return ", ".join(t.replace("_", " ") for t in tokens)
+    return ", ".join(_escape_unescaped_parentheses(t.replace("_", " ")) for t in tokens)
 
 
 def _guess_file_ext_from_url(url: Any) -> str:
@@ -991,7 +1003,11 @@ class DanbooruTagSorter:
         # 精确匹配黑名单
         exact_blacklist_set = set()
         if tag_blacklist:
-            exact_blacklist_set = {t.strip().lower() for t in tag_blacklist.split(',') if t.strip()}
+            exact_blacklist_set = {
+                _unescape_comfy_parentheses(t.strip()).lower()
+                for t in tag_blacklist.split(',')
+                if t.strip()
+            }
 
         # 正则匹配黑名单
         regex_pattern = None
@@ -1010,10 +1026,12 @@ class DanbooruTagSorter:
             tag_clean = tag.strip()
             if _is_metadata_like_token(tag_clean):
                 continue
-            tag_lower = tag_clean.lower()
+            tag_for_lookup = _unescape_comfy_parentheses(tag_clean)
+            tag_for_output = _escape_unescaped_parentheses(tag_clean)
+            tag_lower = tag_for_lookup.lower()
             # 黑名单check
             if (tag_lower in exact_blacklist_set or
-                    (regex_pattern and regex_pattern.search(tag_clean))):
+                    (regex_pattern and regex_pattern.search(tag_for_lookup))):
                 continue
             lookup_key = tag_lower.replace('_', ' ')  # 构造查询Key
             if lookup_key in self.tag_db:  # 缓存命中
@@ -1025,13 +1043,13 @@ class DanbooruTagSorter:
                 # 检查该分类是否在Order列表中
                 if group_key in allowed_categories_set:
                     # 如果在Order里就正常归类
-                    new_category_buckets[group_key].append((info['rank'], tag))
+                    new_category_buckets[group_key].append((info['rank'], tag_for_output))
                 else:
                     # 如果mapping有这个分类，但order里被删除了，视为未匹配，归入Default
-                    unmatched_tags.append(tag)
+                    unmatched_tags.append(tag_for_output)
             else:
                 # 缓存未命中就丢到未匹配列表
-                unmatched_tags.append(tag)
+                unmatched_tags.append(tag_for_output)
 
         #构建输出
         #categorized_tags给Getter节点用
@@ -1122,6 +1140,7 @@ class DanbooruTagSorterSelectorNode:
                 # 用 optional + 前端隐藏，确保会随 workflow 序列化并传入后端
                 "selected_tags_json": ("STRING", {"default": "[]", "multiline": True}),
                 "selected_categories_json": ("STRING", {"default": "[]", "multiline": True}),
+                "manual_category_tags_json": ("STRING", {"default": "{}", "multiline": True}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -1154,6 +1173,7 @@ class DanbooruTagSorterSelectorNode:
         keep_trailing_comma=True,
         selected_tags_json="[]",
         selected_categories_json="[]",
+        manual_category_tags_json="{}",
         unique_id=None,
     ):
         all_str, cat_dict, _, _, _ = _execute_sorting(
@@ -1210,9 +1230,9 @@ class DanbooruTagGalleryLiteNode:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("images", "prompts")
-    OUTPUT_IS_LIST = (True, True)
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("images", "prompts", "merged_prompt")
+    OUTPUT_IS_LIST = (True, True, False)
     FUNCTION = "get_selected_data"
     CATEGORY = "Danbooru Toolkit/Gallery"
     OUTPUT_NODE = True
@@ -1223,12 +1243,12 @@ class DanbooruTagGalleryLiteNode:
 
     def get_selected_data(self, selection_data="{}", **kwargs):
         if not selection_data or selection_data == "{}":
-            return ([_empty_image_tensor()], [""])
+            return ([_empty_image_tensor()], [""], "")
 
         try:
             payload = json.loads(selection_data)
         except Exception:
-            return ([_empty_image_tensor()], [""])
+            return ([_empty_image_tensor()], [""], "")
 
         selections: List[Dict[str, Any]] = []
         if isinstance(payload, dict):
@@ -1246,7 +1266,7 @@ class DanbooruTagGalleryLiteNode:
             ]
 
         if not selections:
-            return ([_empty_image_tensor()], [""])
+            return ([_empty_image_tensor()], [""], "")
 
         # 可选安全阈值：当 _GALLERY_OUTPUT_SELECTION_LIMIT > 0 时限制输出数量。
         raw_count = len(selections)
@@ -1290,15 +1310,31 @@ class DanbooruTagGalleryLiteNode:
             prompts.append(prompt)
 
         if not images:
-            return ([_empty_image_tensor()], [""])
+            return ([_empty_image_tensor()], [""], "")
 
-        first_prompt = prompts[0] if prompts else ""
+        normalized_prompts = [
+            _escape_unescaped_parentheses(str(p or "").strip()) if str(p or "").strip() else ""
+            for p in prompts
+        ]
+        merged_prompt_list: List[str] = []
+        seen_prompt = set()
+        for prompt in normalized_prompts:
+            text = str(prompt or "").strip()
+            if not text:
+                continue
+            key = _unescape_comfy_parentheses(text).lower()
+            if key in seen_prompt:
+                continue
+            seen_prompt.add(key)
+            merged_prompt_list.append(text)
+        merged_prompt = ", ".join(merged_prompt_list)
+        first_prompt = normalized_prompts[0] if normalized_prompts else ""
         print(
             f"[DanbooruTagToolkit] Gallery output debug: raw_selections={raw_count}, "
             f"used={len(selections)}, prompts_out={len(prompts)}, "
             f"first_prompt_preview={first_prompt[:120]!r}"
         )
-        return (images, prompts)
+        return (images, normalized_prompts, merged_prompt)
 
 
 # Selector 前端拉取最新 TAG_BUNDLE 的 API

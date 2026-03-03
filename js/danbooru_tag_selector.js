@@ -4,6 +4,8 @@ import { api } from "/scripts/api.js";
 
 const EXT_NAME = "Comfy.DanbooruTagToolkit";
 const STYLE_ID = "danbooru-tag-selector-style";
+const DANBOORU_AUTOCOMPLETE_CACHE = new Map();
+const DANBOORU_AUTOCOMPLETE_CACHE_TTL_MS = 60 * 1000;
 const I18N = {
     en: {
         title_integrated: "Danbooru Tag Toolkit - All-in-One",
@@ -31,6 +33,9 @@ const I18N = {
         empty_no_data_selector: "No data. Run workflow then refresh.",
         empty_no_selected_rows: "No selected category rows.",
         empty_selected_line: "(no tags yet)",
+        row_add_tags: "Add tags",
+        row_add_btn: "Add",
+        row_add_ph: "tag1, tag2",
         empty_preview: "(empty)",
         meta_line: "Output tags: {output} | Selected tags: {selected} | Selected categories: {categories}",
         status_ready: "Ready.",
@@ -105,6 +110,9 @@ const I18N = {
         empty_no_data_selector: "暂无数据，请先运行工作流再刷新。",
         empty_no_selected_rows: "暂无已选分类行。",
         empty_selected_line: "(暂无标签)",
+        row_add_tags: "添加标签",
+        row_add_btn: "添加",
+        row_add_ph: "标签1, 标签2",
         empty_preview: "(空)",
         meta_line: "输出标签: {output} | 已选标签: {selected} | 已选分类: {categories}",
         status_ready: "就绪。",
@@ -468,6 +476,66 @@ function injectStyle() {
             font-size: 11px;
             word-break: break-word;
         }
+        .dts-selected-add {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 6px;
+            margin-top: 6px;
+            align-items: start;
+        }
+        .dts-selected-add-main {
+            position: relative;
+            min-width: 0;
+        }
+        .dts-selected-add .dts-input {
+            flex: 1 1 auto;
+            width: 100%;
+            height: 24px;
+            padding: 0 6px;
+            font-size: 11px;
+        }
+        .dts-selected-add .dts-icon {
+            width: auto;
+            min-width: 42px;
+            padding: 0 8px;
+        }
+        .dts-selected-suggest {
+            position: absolute;
+            left: 0;
+            right: 0;
+            top: calc(100% + 4px);
+            z-index: 25;
+            max-height: 148px;
+            overflow: auto;
+            border: 1px solid #48648b;
+            border-radius: 7px;
+            background: #0f1a2a;
+            box-shadow: 0 8px 18px rgba(0, 0, 0, .35);
+            display: none;
+        }
+        .dts-selected-suggest.open {
+            display: block;
+        }
+        .dts-selected-suggest-item {
+            padding: 5px 7px;
+            font-size: 11px;
+            color: #dce8ff;
+            border-bottom: 1px solid #223852;
+            cursor: pointer;
+            line-height: 1.35;
+            word-break: break-word;
+        }
+        .dts-selected-suggest-item:last-child {
+            border-bottom: none;
+        }
+        .dts-selected-suggest-item:hover {
+            background: #1a2d46;
+            color: #f1f7ff;
+        }
+        .dts-selected-suggest-item.active {
+            background: #264264;
+            color: #f7fbff;
+        }
         .dts-selected-actions {
             display: flex;
             gap: 4px;
@@ -746,6 +814,7 @@ function coerceBoolWidget(widget, defaultValue) {
 function sanitizeLegacyWidgetValues(node) {
     const selectedWidget = getWidget(node, "selected_tags_json");
     const selectedCategoriesWidget = getWidget(node, "selected_categories_json");
+    const manualCategoryTagsWidget = getWidget(node, "manual_category_tags_json");
     const separatorWidget = getWidget(node, "separator");
 
     if (selectedWidget) {
@@ -758,6 +827,12 @@ function sanitizeLegacyWidgetValues(node) {
         const normalizedCategories = JSON.stringify(parseSelected(selectedCategoriesWidget.value));
         if (String(selectedCategoriesWidget.value ?? "") !== normalizedCategories) {
             setWidgetValue(selectedCategoriesWidget, normalizedCategories);
+        }
+    }
+    if (manualCategoryTagsWidget) {
+        const normalizedManual = JSON.stringify(parseManualCategoryTags(manualCategoryTagsWidget.value));
+        if (String(manualCategoryTagsWidget.value ?? "") !== normalizedManual) {
+            setWidgetValue(manualCategoryTagsWidget, normalizedManual);
         }
     }
 
@@ -790,6 +865,59 @@ function parseSelected(rawValue) {
         console.warn("[DanbooruTagToolkit] parse selection failed:", error);
     }
     return [];
+}
+
+function splitTagText(rawValue) {
+    if (Array.isArray(rawValue)) {
+        return rawValue.map(v => String(v || "").trim()).filter(Boolean);
+    }
+    return String(rawValue || "")
+        .split(",")
+        .map(v => String(v || "").trim())
+        .filter(Boolean);
+}
+
+function parseTagInputContext(rawValue) {
+    const text = String(rawValue || "");
+    const parts = text.split(",");
+    const token = String(parts[parts.length - 1] || "").trim();
+    const prefixParts = parts
+        .slice(0, -1)
+        .map(v => String(v || "").trim())
+        .filter(Boolean);
+    return { token, prefixParts };
+}
+
+function parseManualCategoryTags(rawValue) {
+    const result = {};
+    if (!rawValue) return result;
+    let parsed = rawValue;
+    if (typeof rawValue === "string") {
+        try {
+            parsed = JSON.parse(rawValue);
+        } catch {
+            return result;
+        }
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return result;
+    for (const [category, tags] of Object.entries(parsed)) {
+        const key = String(category || "").trim();
+        if (!key) continue;
+        const normalized = splitTagText(tags);
+        if (!normalized.length) continue;
+        const seen = new Set();
+        const unique = [];
+        normalized.forEach(tag => {
+            const n = normalizeTag(tag);
+            if (!n || seen.has(n)) return;
+            seen.add(n);
+            unique.push(tag);
+        });
+        if (unique.length) {
+            result[key] = unique;
+        }
+    }
+    return result;
 }
 
 function normalizeTag(tag) {
@@ -905,6 +1033,7 @@ function getLinkedStringValue(node, inputName) {
         "filter_data",
         "selected_tags_json",
         "selected_categories_json",
+        "manual_category_tags_json",
     ]);
 
     let longest = "";
@@ -947,6 +1076,90 @@ function normalizeCategories(input) {
         result[category] = tags.map(t => String(t).trim()).filter(Boolean);
     }
     return result;
+}
+
+function resolveCategoryName(categories, targetCategory) {
+    const targetKey = normalizeCategory(targetCategory);
+    for (const category of Object.keys(categories || {})) {
+        if (normalizeCategory(category) === targetKey) {
+            return category;
+        }
+    }
+    return String(targetCategory || "").trim();
+}
+
+function syncManualTagsWidget(node, markDirty = true) {
+    const state = node.__dtsState;
+    if (!state?.manualCategoryTagsWidget) return;
+    setWidgetValue(state.manualCategoryTagsWidget, JSON.stringify(state.manualCategoryTags || {}));
+    if (markDirty) {
+        node.setDirtyCanvas(true, true);
+        app.graph?.setDirtyCanvas?.(true, true);
+    }
+}
+
+function applyManualTagsToCategories(state) {
+    const manual = state?.manualCategoryTags || {};
+    if (!state || !manual || typeof manual !== "object") return;
+    for (const [category, tags] of Object.entries(manual)) {
+        const resolvedCategory = resolveCategoryName(state.categories || {}, category);
+        const existing = Array.isArray(state.categories?.[resolvedCategory]) ? [...state.categories[resolvedCategory]] : [];
+        const seen = new Set(existing.map(normalizeTag));
+        splitTagText(tags).forEach(tag => {
+            const key = normalizeTag(tag);
+            if (!key || seen.has(key)) return;
+            seen.add(key);
+            existing.push(tag);
+        });
+        if (existing.length) {
+            state.categories[resolvedCategory] = existing;
+        }
+    }
+}
+
+function addManualTagsToCategory(node, category, rawTags) {
+    const state = node.__dtsState;
+    if (!state) return;
+    const resolvedCategory = resolveCategoryName(state.categories || {}, category);
+    const nextTags = splitTagText(rawTags);
+    if (!nextTags.length) return;
+
+    if (!state.manualCategoryTags || typeof state.manualCategoryTags !== "object") {
+        state.manualCategoryTags = {};
+    }
+    const existingManual = splitTagText(state.manualCategoryTags[resolvedCategory] || []);
+    const seenManual = new Set(existingManual.map(normalizeTag));
+    nextTags.forEach(tag => {
+        const key = normalizeTag(tag);
+        if (!key || seenManual.has(key)) return;
+        seenManual.add(key);
+        existingManual.push(tag);
+    });
+    state.manualCategoryTags[resolvedCategory] = existingManual;
+
+    const existingCategoryTags = Array.isArray(state.categories?.[resolvedCategory]) ? [...state.categories[resolvedCategory]] : [];
+    const seenCategory = new Set(existingCategoryTags.map(normalizeTag));
+    nextTags.forEach(tag => {
+        const key = normalizeTag(tag);
+        if (!key || seenCategory.has(key)) return;
+        seenCategory.add(key);
+        existingCategoryTags.push(tag);
+    });
+    state.categories[resolvedCategory] = existingCategoryTags;
+
+    const selectedSeen = new Set((state.selected || []).map(normalizeTag));
+    nextTags.forEach(tag => {
+        const key = normalizeTag(tag);
+        if (!key || selectedSeen.has(key)) return;
+        selectedSeen.add(key);
+        state.selected.push(tag);
+    });
+
+    syncManualTagsWidget(node, false);
+    updateCategoryOrderFromSelection(state);
+    syncSelectedWidget(node, false);
+    syncSelectedCategoriesWidget(node);
+    renderAll(node);
 }
 
 function getTagCategoryMap(categories) {
@@ -1062,6 +1275,12 @@ function getOrderedSelectedTags(state) {
             }
         }
     }
+    for (const tag of state.selected || []) {
+        const key = normalizeTag(tag);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        tags.push(tag);
+    }
     return tags;
 }
 
@@ -1104,6 +1323,8 @@ function getOutputTagsForPreview(node) {
             const key = normalizeTag(tag);
             if (key in availableMap) {
                 mergedTags.push(availableMap[key]);
+            } else if (String(tag || "").trim()) {
+                mergedTags.push(String(tag).trim());
             }
         }
     } else if (selectedCategories.length) {
@@ -1194,6 +1415,11 @@ function pruneSelectionByAvailability(state) {
     const available = new Set();
     for (const tags of Object.values(state.categories)) {
         for (const tag of tags) available.add(normalizeTag(tag));
+    }
+    for (const tags of Object.values(state.manualCategoryTags || {})) {
+        for (const tag of splitTagText(tags)) {
+            available.add(normalizeTag(tag));
+        }
     }
     state.selected = state.selected.filter(tag => available.has(normalizeTag(tag)));
 }
@@ -1349,6 +1575,27 @@ async function fetchJsonOrThrow(url, options = undefined) {
         throw new Error(detail ? `HTTP ${response.status}: ${detail}` : `HTTP ${response.status}`);
     }
     return response.json();
+}
+
+async function fetchDanbooruAutocompleteItems(query, limit = 20) {
+    const normalized = String(query || "").trim().toLowerCase();
+    if (normalized.length < 2) return [];
+
+    const now = Date.now();
+    const cacheKey = `${normalized}|${limit}`;
+    const cached = DANBOORU_AUTOCOMPLETE_CACHE.get(cacheKey);
+    if (cached && (now - cached.ts) < DANBOORU_AUTOCOMPLETE_CACHE_TTL_MS) {
+        return Array.isArray(cached.items) ? cached.items : [];
+    }
+
+    const params = new URLSearchParams({
+        q: normalized,
+        limit: String(Math.max(1, Math.min(50, Number(limit) || 20))),
+    });
+    const payload = await fetchJsonOrThrow(`/danbooru_tag_gallery/autocomplete?${params.toString()}`, { cache: "no-store" });
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+    DANBOORU_AUTOCOMPLETE_CACHE.set(cacheKey, { ts: now, items });
+    return items;
 }
 
 function normalizeDefaultCategoryValue(rawValue, fallback = "未归类词") {
@@ -1623,6 +1870,7 @@ async function refreshCategories(node) {
         if (requestId !== state.refreshRequestId) return;
         const tBeforeRender = performance.now();
         state.categories = normalizeCategories(payload.categories || {});
+        applyManualTagsToCategories(state);
 
         pruneSelectionByAvailability(state);
         pruneCategorySelectionByAvailability(state);
@@ -1718,6 +1966,10 @@ function clearCategory(node, category) {
 
     const removeSet = new Set((state.categories[category] || []).map(normalizeTag));
     state.selected = state.selected.filter(tag => !removeSet.has(normalizeTag(tag)));
+    if (state.manualCategoryTags && typeof state.manualCategoryTags === "object") {
+        delete state.manualCategoryTags[category];
+        syncManualTagsWidget(node, false);
+    }
 
     updateCategoryOrderFromSelection(state);
     syncSelectedWidget(node);
@@ -1732,6 +1984,15 @@ function removeSelectedCategory(node, category) {
     state.selected = state.selected.filter(tag => !removeSet.has(normalizeTag(tag)));
     state.selectedCategories = (state.selectedCategories || [])
         .filter(cat => normalizeCategory(cat) !== normalizeCategory(category));
+    if (state.manualCategoryTags && typeof state.manualCategoryTags === "object") {
+        const keys = Object.keys(state.manualCategoryTags);
+        keys.forEach(key => {
+            if (normalizeCategory(key) === normalizeCategory(category)) {
+                delete state.manualCategoryTags[key];
+            }
+        });
+        syncManualTagsWidget(node, false);
+    }
 
     updateCategoryOrderFromSelection(state);
     syncSelectedWidget(node, false);
@@ -1895,8 +2156,194 @@ function renderSelected(node) {
         rowText.className = "dts-selected-line";
         rowText.textContent = tags.length ? tags.join(", ") : tr(state, "empty_selected_line");
 
+        const addWrap = document.createElement("div");
+        addWrap.className = "dts-selected-add";
+        const addInput = document.createElement("input");
+        addInput.className = "dts-input";
+        addInput.placeholder = tr(state, "row_add_ph");
+        const addMain = document.createElement("div");
+        addMain.className = "dts-selected-add-main";
+        const suggestPanel = document.createElement("div");
+        suggestPanel.className = "dts-selected-suggest";
+        let suggestReqId = 0;
+        let suggestTimer = null;
+        let suggestValues = [];
+        let activeSuggestIndex = -1;
+        const closeSuggestPanel = () => {
+            suggestPanel.classList.remove("open");
+            activeSuggestIndex = -1;
+        };
+        const setActiveSuggestIndex = indexValue => {
+            activeSuggestIndex = indexValue;
+            const items = suggestPanel.querySelectorAll(".dts-selected-suggest-item");
+            items.forEach((el, idx) => {
+                if (idx === activeSuggestIndex) {
+                    el.classList.add("active");
+                    try {
+                        el.scrollIntoView({ block: "nearest" });
+                    } catch {
+                        // older browser fallback
+                    }
+                } else {
+                    el.classList.remove("active");
+                }
+            });
+        };
+        const applySuggestionValue = value => {
+            const text = String(value || "").trim();
+            if (!text) return;
+            addInput.value = text;
+            closeSuggestPanel();
+            addInput.focus();
+        };
+        const renderSuggestPanel = values => {
+            suggestValues = Array.isArray(values) ? values.slice(0, 80) : [];
+            suggestPanel.innerHTML = "";
+            if (!suggestValues.length) {
+                closeSuggestPanel();
+                return;
+            }
+            suggestValues.forEach((value, idx) => {
+                const row = document.createElement("div");
+                row.className = "dts-selected-suggest-item";
+                row.textContent = value;
+                row.addEventListener("mouseenter", () => setActiveSuggestIndex(idx));
+                row.addEventListener("mousedown", event => {
+                    event.preventDefault();
+                });
+                row.addEventListener("click", () => {
+                    applySuggestionValue(value);
+                });
+                suggestPanel.appendChild(row);
+            });
+            if (document.activeElement === addInput) {
+                suggestPanel.classList.add("open");
+            } else {
+                closeSuggestPanel();
+            }
+        };
+        const upsertSuggestOption = (set, listValues, value) => {
+            const text = String(value || "").trim();
+            const key = normalizeTag(text);
+            if (!key || set.has(key)) return false;
+            set.add(key);
+            listValues.push(text);
+            return true;
+        };
+        const rebuildSuggestList = remoteItems => {
+            const listValues = [];
+            const suggestSet = new Set();
+            const { prefixParts, token } = parseTagInputContext(addInput.value);
+            const prefix = prefixParts.join(", ");
+            const tokenLower = token.toLowerCase();
+            const composeWithPrefix = rawTag => {
+                const text = String(rawTag || "").trim();
+                if (!text) return "";
+                return prefix ? `${prefix}, ${text}` : text;
+            };
+            const localCandidates = [
+                ...(state.categories[category] || []),
+                ...splitTagText((state.manualCategoryTags || {})[category] || []),
+                ...(state.selected || []),
+            ];
+            for (const candidate of localCandidates) {
+                const text = String(candidate || "").trim();
+                if (!text) continue;
+                if (tokenLower && !text.toLowerCase().includes(tokenLower)) continue;
+                upsertSuggestOption(suggestSet, listValues, composeWithPrefix(text));
+                if (suggestSet.size >= 120) break;
+            }
+            for (const item of (remoteItems || [])) {
+                const rawName = String(item?.name || "").trim();
+                if (!rawName) continue;
+                const normalizedTag = rawName.replaceAll("_", " ");
+                upsertSuggestOption(suggestSet, listValues, composeWithPrefix(normalizedTag));
+                if (suggestSet.size >= 220) break;
+            }
+            renderSuggestPanel(listValues);
+        };
+        const requestDanbooruSuggest = async () => {
+            const reqId = ++suggestReqId;
+            const { token } = parseTagInputContext(addInput.value);
+            if (token.length < 2) {
+                rebuildSuggestList([]);
+                return;
+            }
+            try {
+                const items = await fetchDanbooruAutocompleteItems(token, 20);
+                if (reqId !== suggestReqId) return;
+                rebuildSuggestList(items);
+            } catch {
+                if (reqId !== suggestReqId) return;
+                rebuildSuggestList([]);
+            }
+        };
+        rebuildSuggestList([]);
+        const addBtn = document.createElement("button");
+        addBtn.className = "dts-icon";
+        addBtn.textContent = tr(state, "row_add_btn");
+        addBtn.title = tr(state, "row_add_tags");
+        const commitAdd = () => {
+            const text = String(addInput.value || "").trim();
+            if (!text) return;
+            addManualTagsToCategory(node, category, text);
+            addInput.value = "";
+            closeSuggestPanel();
+        };
+        addBtn.onclick = commitAdd;
+        addInput.addEventListener("input", () => {
+            if (!suggestPanel.classList.contains("open")) {
+                suggestPanel.classList.add("open");
+            }
+            if (suggestTimer) clearTimeout(suggestTimer);
+            suggestTimer = setTimeout(() => {
+                requestDanbooruSuggest();
+            }, 140);
+        });
+        addInput.addEventListener("focus", () => {
+            requestDanbooruSuggest();
+            if (suggestValues.length) suggestPanel.classList.add("open");
+        });
+        addInput.addEventListener("blur", () => {
+            setTimeout(() => closeSuggestPanel(), 120);
+        });
+        addInput.addEventListener("keydown", event => {
+            if (event.key === "ArrowDown" && suggestValues.length) {
+                event.preventDefault();
+                const nextIndex = activeSuggestIndex < suggestValues.length - 1 ? activeSuggestIndex + 1 : 0;
+                setActiveSuggestIndex(nextIndex);
+                suggestPanel.classList.add("open");
+                return;
+            }
+            if (event.key === "ArrowUp" && suggestValues.length) {
+                event.preventDefault();
+                const nextIndex = activeSuggestIndex > 0 ? activeSuggestIndex - 1 : suggestValues.length - 1;
+                setActiveSuggestIndex(nextIndex);
+                suggestPanel.classList.add("open");
+                return;
+            }
+            if (event.key === "Escape") {
+                closeSuggestPanel();
+                return;
+            }
+            if (event.key === "Enter") {
+                if (activeSuggestIndex >= 0 && activeSuggestIndex < suggestValues.length) {
+                    event.preventDefault();
+                    applySuggestionValue(suggestValues[activeSuggestIndex]);
+                    return;
+                }
+                event.preventDefault();
+                commitAdd();
+            }
+        });
+        addMain.appendChild(addInput);
+        addMain.appendChild(suggestPanel);
+        addWrap.appendChild(addMain);
+        addWrap.appendChild(addBtn);
+
         body.appendChild(rowTitle);
         body.appendChild(rowText);
+        body.appendChild(addWrap);
 
         const actions = document.createElement("div");
         actions.className = "dts-selected-actions";
@@ -2526,6 +2973,7 @@ app.registerExtension({
 
             const selectedWidget = getWidget(this, "selected_tags_json");
             const selectedCategoriesWidget = getWidget(this, "selected_categories_json");
+            const manualCategoryTagsWidget = getWidget(this, "manual_category_tags_json");
             const prefixWidget = getWidget(this, "prefix_text");
             const separatorWidget = getWidget(this, "separator");
             const useAllWidget = getWidget(this, "use_all_when_empty");
@@ -2547,7 +2995,7 @@ app.registerExtension({
 
             sanitizeLegacyWidgetValues(this);
 
-            [selectedWidget, selectedCategoriesWidget, prefixWidget, separatorWidget, useAllWidget, dedupeWidget, trailingWidget].forEach(hideWidget);
+            [selectedWidget, selectedCategoriesWidget, manualCategoryTagsWidget, prefixWidget, separatorWidget, useAllWidget, dedupeWidget, trailingWidget].forEach(hideWidget);
             if (isIntegratedNode) {
                 [
                     excelWidget,
@@ -2721,6 +3169,7 @@ app.registerExtension({
                 compact: false,
                 selectedWidget,
                 selectedCategoriesWidget,
+                manualCategoryTagsWidget,
                 prefixWidget,
                 separatorWidget,
                 useAllWidget,
@@ -2743,6 +3192,7 @@ app.registerExtension({
                 categories: {},
                 selected: parseSelected(selectedWidget?.value),
                 selectedCategories: parseSelected(selectedCategoriesWidget?.value),
+                manualCategoryTags: parseManualCategoryTags(manualCategoryTagsWidget?.value),
                 categoryOrder: [],
                 dragIndex: null,
                 refreshTimer: null,
@@ -2801,10 +3251,15 @@ app.registerExtension({
                 const state = this.__dtsState;
                 state.selected = [];
                 state.selectedCategories = [];
+                state.manualCategoryTags = {};
                 state.categoryOrder = [];
+                syncManualTagsWidget(this, false);
                 syncSelectedWidget(this, false);
                 syncSelectedCategoriesWidget(this);
                 renderAll(this);
+                if (state.isIntegrated) {
+                    scheduleRefresh(this, 120);
+                }
             };
 
             searchInput.oninput = () => {
@@ -2856,6 +3311,8 @@ app.registerExtension({
             sanitizeLegacyWidgetValues(this);
             state.selected = parseSelected(state.selectedWidget?.value);
             state.selectedCategories = parseSelected(state.selectedCategoriesWidget?.value);
+            state.manualCategoryTags = parseManualCategoryTags(state.manualCategoryTagsWidget?.value);
+            applyManualTagsToCategories(state);
             syncSettingsFromWidgets(this);
             updateCategoryOrderFromSelection(state);
             syncRootLayout(this);
@@ -2873,6 +3330,7 @@ app.registerExtension({
             const settingsSet = new Set([
                 "selected_tags_json",
                 "selected_categories_json",
+                "manual_category_tags_json",
                 "prefix_text",
                 "separator",
                 "use_all_when_empty",
@@ -2900,8 +3358,14 @@ app.registerExtension({
                     state.selectedCategories = parseSelected(state.selectedCategoriesWidget?.value);
                     updateCategoryOrderFromSelection(state);
                 }
+                if (widget.name === "manual_category_tags_json") {
+                    state.manualCategoryTags = parseManualCategoryTags(state.manualCategoryTagsWidget?.value);
+                    applyManualTagsToCategories(state);
+                    pruneSelectionByAvailability(state);
+                    updateCategoryOrderFromSelection(state);
+                }
                 syncSettingsFromWidgets(this);
-                if (widget.name === "selected_tags_json" || widget.name === "selected_categories_json") {
+                if (widget.name === "selected_tags_json" || widget.name === "selected_categories_json" || widget.name === "manual_category_tags_json") {
                     renderAll(this);
                 } else {
                     renderPreview(this);
