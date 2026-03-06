@@ -196,6 +196,167 @@ def _dedupe_string_list(values: Any, unescape_parentheses: bool = False) -> List
     return unique
 
 
+def _normalize_specificity_tag(text: Any) -> str:
+    normalized = _unescape_comfy_parentheses(text)
+    normalized = str(normalized or "").replace("_", " ").strip().lower()
+    return re.sub(r"\s+", " ", normalized)
+
+
+def _build_specificity_variants(tag: Any, match_singular_plural: bool = True) -> List[str]:
+    normalized = _normalize_specificity_tag(tag)
+    if not normalized:
+        return []
+
+    prefix, _, last_word = normalized.rpartition(" ")
+    if not last_word:
+        return []
+
+    prefix_text = f"{prefix} " if prefix else ""
+    last_variants = [last_word]
+
+    if match_singular_plural:
+        if last_word.endswith("ies") and len(last_word) > 3:
+            last_variants.append(last_word[:-3] + "y")
+        elif last_word.endswith("y") and len(last_word) > 1:
+            last_variants.append(last_word[:-1] + "ies")
+
+        if last_word.endswith("s") and len(last_word) > 1 and not last_word.endswith("ss"):
+            last_variants.append(last_word[:-1])
+        else:
+            last_variants.append(last_word + "s")
+
+    variants: List[str] = []
+    seen = set()
+    for last_variant in last_variants:
+        candidate = f"{prefix_text}{last_variant}".strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        variants.append(candidate)
+    return variants
+
+
+def _parse_tag_text_block(raw_value: Any) -> List[str]:
+    if not isinstance(raw_value, str):
+        return []
+    return [part.strip() for part in re.split(r"[,\r\n]+", raw_value) if part.strip()]
+
+
+def _join_tag_text(tags: List[str], keep_trailing_comma: bool = False) -> str:
+    cleaned_tags = [str(tag or "").strip() for tag in tags if str(tag or "").strip()]
+    if not cleaned_tags:
+        return ""
+    result = ", ".join(cleaned_tags)
+    if keep_trailing_comma:
+        return result + ", "
+    return result
+
+
+def _unwrap_list_input(value: Any, default: Any = None) -> Any:
+    if isinstance(value, list):
+        if not value:
+            return default
+        return value[0]
+    return value if value is not None else default
+
+
+def _tag_is_covered_by_specific_variant(
+    base_tag: str,
+    candidate_tags: List[str],
+    match_singular_plural: bool = True,
+    min_prefix_words: int = 1,
+) -> bool:
+    base_variants = _build_specificity_variants(base_tag, match_singular_plural)
+    if not base_variants:
+        return False
+
+    blocked_prefix_tokens = {"no", "without"}
+
+    for candidate_tag in candidate_tags:
+        candidate_variants = _build_specificity_variants(candidate_tag, match_singular_plural)
+        for candidate_variant in candidate_variants:
+            for base_variant in base_variants:
+                if candidate_variant == base_variant:
+                    continue
+
+                suffix = f" {base_variant}"
+                if not candidate_variant.endswith(suffix):
+                    continue
+
+                prefix = candidate_variant[:-len(suffix)].strip()
+                if not prefix:
+                    continue
+
+                prefix_tokens = prefix.split()
+                if len(prefix_tokens) < max(1, min_prefix_words):
+                    continue
+                if prefix_tokens[-1] in blocked_prefix_tokens:
+                    continue
+                return True
+
+    return False
+
+
+def _clean_specificity_prompt(
+    raw_prompt: Any,
+    preserve_tags_text: Any = "",
+    match_singular_plural: bool = True,
+    min_prefix_words: int = 1,
+    keep_trailing_comma: bool = False,
+) -> Dict[str, Any]:
+    source_text = str(raw_prompt or "")
+    candidate_tags = _dedupe_string_list(_parse_tag_text_block(source_text), unescape_parentheses=True)
+
+    preserve_variants = set()
+    for preserve_tag in _parse_tag_text_block(str(preserve_tags_text or "")):
+        preserve_variants.update(_build_specificity_variants(preserve_tag, match_singular_plural))
+
+    cleaned_tags: List[str] = []
+    removed_tags: List[str] = []
+
+    for tag in candidate_tags:
+        tag_variants = _build_specificity_variants(tag, match_singular_plural)
+        if any(variant in preserve_variants for variant in tag_variants):
+            cleaned_tags.append(tag)
+            continue
+
+        if _tag_is_covered_by_specific_variant(
+            base_tag=tag,
+            candidate_tags=candidate_tags,
+            match_singular_plural=match_singular_plural,
+            min_prefix_words=min_prefix_words,
+        ):
+            removed_tags.append(tag)
+            continue
+
+        cleaned_tags.append(tag)
+
+    escaped_cleaned_tags = [_escape_unescaped_parentheses(tag) for tag in cleaned_tags]
+    escaped_removed_tags = [_escape_unescaped_parentheses(tag) for tag in removed_tags]
+    return {
+        "cleaned_tags": escaped_cleaned_tags,
+        "removed_tags": escaped_removed_tags,
+        "cleaned_prompt": _join_tag_text(escaped_cleaned_tags, keep_trailing_comma=keep_trailing_comma),
+        "removed_prompt": _join_tag_text(escaped_removed_tags, keep_trailing_comma=False),
+    }
+
+
+def _merge_tag_prompt_texts(tag_texts: List[str], keep_trailing_comma: bool = False) -> str:
+    merged_tags: List[str] = []
+    seen = set()
+
+    for tag_text in tag_texts:
+        for tag in _parse_tag_text_block(str(tag_text or "")):
+            escaped_tag = _escape_unescaped_parentheses(tag)
+            key = _normalize_specificity_tag(escaped_tag)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged_tags.append(escaped_tag)
+
+    return _join_tag_text(merged_tags, keep_trailing_comma=keep_trailing_comma)
+
+
 def _extract_tags_text_from_payload(raw_value: Any, depth: int = 0) -> str:
     if depth > 3:
         return ""
@@ -1358,6 +1519,75 @@ class DanbooruTagGalleryLiteNode:
 
 
 # Selector 前端拉取最新 TAG_BUNDLE 的 API
+class DanbooruTagSpecificCleanerNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "tags": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "placeholder": "jacket, white jacket, pantyhose, black pantyhose",
+                }),
+            },
+            "optional": {
+                "preserve_tags": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "placeholder": "Optional whitelist: 1girl, jacket",
+                }),
+                "match_singular_plural": ("BOOLEAN", {"default": True}),
+                "min_prefix_words": ("INT", {"default": 1, "min": 1, "max": 4, "step": 1}),
+                "keep_trailing_comma": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    INPUT_IS_LIST = True
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("cleaned_prompt", "removed_tags", "cleaned_prompt_list", "removed_tags_list")
+    OUTPUT_IS_LIST = (False, False, True, True)
+    FUNCTION = "clean_tags"
+    CATEGORY = "Danbooru Toolkit/Filter"
+
+    def clean_tags(
+        self,
+        tags,
+        preserve_tags="",
+        match_singular_plural=True,
+        min_prefix_words=1,
+        keep_trailing_comma=False,
+    ):
+        prompt_items = tags if isinstance(tags, list) else [tags]
+        preserve_tags_text = str(_unwrap_list_input(preserve_tags, "") or "")
+        use_plural_matching = _as_bool(_unwrap_list_input(match_singular_plural, True), True)
+        keep_trailing = _as_bool(_unwrap_list_input(keep_trailing_comma, False), False)
+
+        try:
+            prefix_words = int(_unwrap_list_input(min_prefix_words, 1) or 1)
+        except Exception:
+            prefix_words = 1
+        prefix_words = max(1, min(4, prefix_words))
+
+        cleaned_prompt_list: List[str] = []
+        removed_tags_list: List[str] = []
+
+        for prompt_text in prompt_items:
+            result = _clean_specificity_prompt(
+                raw_prompt=prompt_text,
+                preserve_tags_text=preserve_tags_text,
+                match_singular_plural=use_plural_matching,
+                min_prefix_words=prefix_words,
+                keep_trailing_comma=keep_trailing,
+            )
+            cleaned_prompt_list.append(result["cleaned_prompt"])
+            removed_tags_list.append(result["removed_prompt"])
+
+        merged_cleaned_prompt = _merge_tag_prompt_texts(cleaned_prompt_list, keep_trailing_comma=keep_trailing)
+        merged_removed_tags = _merge_tag_prompt_texts(removed_tags_list, keep_trailing_comma=False)
+        return (merged_cleaned_prompt, merged_removed_tags, cleaned_prompt_list, removed_tags_list)
+
+
+# Selector API for latest TAG_BUNDLE
 if PromptServer is not None and web is not None:
     try:
         @PromptServer.instance.routes.get("/danbooru_tag_picker/latest")
@@ -1601,10 +1831,12 @@ if PromptServer is not None and web is not None:
 NODE_CLASS_MAPPINGS = {
     "DanbooruTagSorterSelectorNode": DanbooruTagSorterSelectorNode,
     "DanbooruTagGalleryLiteNode": DanbooruTagGalleryLiteNode,
+    "DanbooruTagSpecificCleanerNode": DanbooruTagSpecificCleanerNode,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DanbooruTagSorterSelectorNode": "Danbooru Tag Toolkit - All-in-One",
     "DanbooruTagGalleryLiteNode": "Danbooru Tag Toolkit - Danbooru Gallery Lite",
+    "DanbooruTagSpecificCleanerNode": "Danbooru Tag Toolkit - Specific Tag Cleaner",
 }
 
 # 都看到这里了球球给我点点Star吧...(哭
