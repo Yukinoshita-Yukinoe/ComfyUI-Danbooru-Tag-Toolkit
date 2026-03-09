@@ -28,6 +28,7 @@ const I18N = {
         btn_none: "None",
         btn_pick_category: "Pick Cat",
         btn_unpick_category: "Unpick Cat",
+        btn_reset_tag_weights: "W=1",
         filter_all_categories: "All Categories ({count})",
         empty_no_preview_integrated: "No preview data. Check tags/config and refresh.",
         empty_no_data_selector: "No data. Run workflow then refresh.",
@@ -37,6 +38,10 @@ const I18N = {
         row_add_btn: "Add",
         row_add_ph: "tag1, tag2",
         row_weight_title: "Row weight",
+        tag_weight_up: "Increase tag weight",
+        tag_weight_down: "Decrease tag weight",
+        tag_weight_reset: "Reset tag weights in this category",
+        tag_weight_badge: "Tag weight {weight}",
         empty_preview: "(empty)",
         meta_line: "Output tags: {output} | Selected tags: {selected} | Selected categories: {categories}",
         status_ready: "Ready.",
@@ -106,6 +111,7 @@ const I18N = {
         btn_none: "清空",
         btn_pick_category: "选分类",
         btn_unpick_category: "取消分类",
+        btn_reset_tag_weights: "W=1",
         filter_all_categories: "全部分类 ({count})",
         empty_no_preview_integrated: "暂无预览数据，请检查 tags/配置后刷新。",
         empty_no_data_selector: "暂无数据，请先运行工作流再刷新。",
@@ -115,6 +121,10 @@ const I18N = {
         row_add_btn: "添加",
         row_add_ph: "标签1, 标签2",
         row_weight_title: "分类行权重",
+        tag_weight_up: "提高标签权重",
+        tag_weight_down: "降低标签权重",
+        tag_weight_reset: "重置本分类所有标签权重",
+        tag_weight_badge: "标签权重 {weight}",
         empty_preview: "(空)",
         meta_line: "输出标签: {output} | 已选标签: {selected} | 已选分类: {categories}",
         status_ready: "就绪。",
@@ -402,12 +412,15 @@ function injectStyle() {
         .dts-tag {
             border: 1px solid #4f678e;
             border-radius: 999px;
-            padding: 3px 9px;
+            padding: 3px 8px 3px 9px;
             background: #182943;
             color: #edf4ff;
             cursor: pointer;
             user-select: none;
             line-height: 1.3;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
         }
         .dts-tag:hover {
             border-color: #6a8fbd;
@@ -416,6 +429,59 @@ function injectStyle() {
             border-color: #e4a654;
             background: #3d2a16;
             color: #ffd9a5;
+        }
+        .dts-tag.dts-tag-weighted {
+            border-color: #d9a45c;
+            box-shadow: inset 0 0 0 1px rgba(217, 164, 92, .12);
+        }
+        .dts-tag-label {
+            min-width: 0;
+        }
+        .dts-tag-badge {
+            border-radius: 999px;
+            background: #294261;
+            color: #ffd89c;
+            padding: 1px 5px;
+            font-size: 10px;
+            line-height: 1.2;
+            flex: 0 0 auto;
+        }
+        .dts-tag-controls {
+            width: 14px;
+            display: inline-flex;
+            flex-direction: column;
+            gap: 1px;
+            opacity: 0;
+            pointer-events: none;
+            transform: translateX(2px);
+            transition: opacity .12s ease, transform .12s ease;
+            flex: 0 0 auto;
+        }
+        .dts-tag:hover .dts-tag-controls,
+        .dts-tag:focus-within .dts-tag-controls {
+            opacity: 1;
+            pointer-events: auto;
+            transform: translateX(0);
+        }
+        .dts-tag-step {
+            width: 14px;
+            height: 10px;
+            padding: 0;
+            border: 1px solid #5877a6;
+            border-radius: 4px;
+            background: #1d3558;
+            color: #eef6ff;
+            cursor: pointer;
+            font-size: 8px;
+            line-height: 1;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .dts-tag-step:hover {
+            border-color: #87abe0;
+            background: #27456b;
+        }
         }
         .dts-selected-list {
             margin: 0;
@@ -839,6 +905,7 @@ function sanitizeLegacyWidgetValues(node) {
     const selectedCategoriesWidget = getWidget(node, "selected_categories_json");
     const manualCategoryTagsWidget = getWidget(node, "manual_category_tags_json");
     const selectedCategoryWeightsWidget = getWidget(node, "selected_category_weights_json");
+    const selectedTagWeightsWidget = getWidget(node, "selected_tag_weights_json");
     const prefixWidget = getWidget(node, "prefix_text");
     const separatorWidget = getWidget(node, "separator");
     const useAllWidget = getWidget(node, "use_all_when_empty");
@@ -908,6 +975,12 @@ function sanitizeLegacyWidgetValues(node) {
         const normalizedWeights = JSON.stringify(parseSelectedCategoryWeights(selectedCategoryWeightsWidget.value));
         if (String(selectedCategoryWeightsWidget.value ?? "") !== normalizedWeights) {
             setWidgetValue(selectedCategoryWeightsWidget, normalizedWeights);
+        }
+    }
+    if (selectedTagWeightsWidget) {
+        const normalizedTagWeights = JSON.stringify(parseSelectedTagWeights(selectedTagWeightsWidget.value));
+        if (String(selectedTagWeightsWidget.value ?? "") !== normalizedTagWeights) {
+            setWidgetValue(selectedTagWeightsWidget, normalizedTagWeights);
         }
     }
     if (separatorWidget) {
@@ -1044,6 +1117,29 @@ function parseSelectedCategoryWeights(rawValue) {
     const result = {};
     for (const [category, weight] of Object.entries(parsed)) {
         const key = String(category || "").trim();
+        if (!key) continue;
+        const normalizedWeight = normalizeWeightValue(weight, 1);
+        if (normalizedWeight !== 1) {
+            result[key] = normalizedWeight;
+        }
+    }
+    return result;
+}
+
+function parseSelectedTagWeights(rawValue) {
+    if (!rawValue) return {};
+    let parsed = rawValue;
+    if (typeof rawValue === "string") {
+        try {
+            parsed = JSON.parse(rawValue);
+        } catch {
+            return {};
+        }
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const result = {};
+    for (const [tag, weight] of Object.entries(parsed)) {
+        const key = String(tag || "").trim();
         if (!key) continue;
         const normalizedWeight = normalizeWeightValue(weight, 1);
         if (normalizedWeight !== 1) {
@@ -1444,6 +1540,48 @@ function getResolvedSelectedCategoryWeights(state) {
     return resolved;
 }
 
+function buildAvailableTagLookup(state) {
+    const lookup = {};
+    for (const tags of Object.values(state.categories || {})) {
+        for (const tag of tags) {
+            const key = normalizeTag(tag);
+            if (key && !(key in lookup)) {
+                lookup[key] = tag;
+            }
+        }
+    }
+    return lookup;
+}
+
+function getResolvedSelectedTagWeights(state) {
+    const lookup = buildAvailableTagLookup(state);
+    const resolved = {};
+    for (const [tag, rawWeight] of Object.entries(state.selectedTagWeights || {})) {
+        const key = normalizeTag(tag);
+        if (!key) continue;
+        const resolvedTag = lookup[key] || String(tag || "").trim();
+        if (!resolvedTag) continue;
+        const normalizedWeight = normalizeWeightValue(rawWeight, 1);
+        if (normalizedWeight !== 1) {
+            resolved[resolvedTag] = normalizedWeight;
+        }
+    }
+    return resolved;
+}
+
+function buildWeightedPromptPart(tags, weight) {
+    const cleanedTags = tags
+        .map(tag => String(tag || "").trim())
+        .filter(Boolean);
+    if (!cleanedTags.length) return "";
+
+    const normalizedWeight = normalizeWeightValue(weight, 1);
+    const rowText = cleanedTags.join(", ");
+    return normalizedWeight !== 1
+        ? `(${rowText}:${formatWeightValue(normalizedWeight)})`
+        : rowText;
+}
+
 function getOutputTagsForPreview(node) {
     const state = node.__dtsState;
     if (!state) return [];
@@ -1508,6 +1646,11 @@ function getOutputPartsForPreview(node) {
     const useAllWhenEmpty = normalizeBooleanValue(getWidgetValue(node, "use_all_when_empty", true), true);
     const deduplicateSelected = normalizeBooleanValue(getWidgetValue(node, "deduplicate_selected", true), true);
     const categoryWeights = getResolvedSelectedCategoryWeights(state);
+    const resolvedTagWeights = getResolvedSelectedTagWeights(state);
+    const tagWeights = {};
+    for (const [tag, rawWeight] of Object.entries(resolvedTagWeights)) {
+        tagWeights[normalizeTag(tag)] = normalizeWeightValue(rawWeight, 1);
+    }
 
     if (!selectedTags.length && !activeCategories.length) {
         return useAllWhenEmpty ? getOutputTagsForPreview(node) : [];
@@ -1544,9 +1687,32 @@ function getOutputPartsForPreview(node) {
 
         if (!rowOutput.length) return;
 
-        const rowText = rowOutput.join(", ");
-        const weight = normalizeWeightValue(categoryWeights[category], 1);
-        parts.push(weight !== 1 ? `(${rowText}:${formatWeightValue(weight)})` : rowText);
+        const rowWeight = normalizeWeightValue(categoryWeights[category], 1);
+        if (rowWeight !== 1) {
+            const weightedParts = [];
+            const remainingTags = [];
+            rowOutput.forEach(tag => {
+                const key = normalizeTag(tag);
+                const tagWeight = normalizeWeightValue(tagWeights[key], 1);
+                if (tagWeight !== 1) {
+                    weightedParts.push(buildWeightedPromptPart([tag], tagWeight));
+                } else {
+                    remainingTags.push(tag);
+                }
+            });
+            weightedParts.filter(Boolean).forEach(part => parts.push(part));
+            const groupedPart = buildWeightedPromptPart(remainingTags, rowWeight);
+            if (groupedPart) {
+                parts.push(groupedPart);
+            }
+            return;
+        }
+
+        rowOutput.forEach(tag => {
+            const key = normalizeTag(tag);
+            const tagWeight = normalizeWeightValue(tagWeights[key], 1);
+            parts.push(tagWeight !== 1 ? buildWeightedPromptPart([tag], tagWeight) : tag);
+        });
     });
 
     selectedTags.forEach(tag => {
@@ -1558,7 +1724,8 @@ function getOutputPartsForPreview(node) {
         if (deduplicateSelected) {
             dedupeKeys.add(key);
         }
-        parts.push(text);
+        const tagWeight = normalizeWeightValue(tagWeights[key], 1);
+        parts.push(tagWeight !== 1 ? buildWeightedPromptPart([text], tagWeight) : text);
     });
 
     return parts;
@@ -1659,6 +1826,41 @@ function syncSelectedCategoryWeightsWidget(node, markDirty = true) {
     }
 }
 
+function syncSelectedTagWeightsWidget(node, markDirty = true) {
+    const state = node.__dtsState;
+    if (!state?.selectedTagWeightsWidget) return;
+
+    const lookup = buildAvailableTagLookup(state);
+    const sourceWeights = {};
+    for (const [tag, rawWeight] of Object.entries(state.selectedTagWeights || {})) {
+        const key = normalizeTag(tag);
+        if (!key || !(key in lookup) || key in sourceWeights) continue;
+        sourceWeights[key] = normalizeWeightValue(rawWeight, 1);
+    }
+
+    const orderedWeights = {};
+    const seen = new Set();
+    for (const tags of Object.values(state.categories || {})) {
+        for (const tag of tags) {
+            const key = normalizeTag(tag);
+            if (!key || seen.has(key)) continue;
+            seen.add(key);
+            const weight = normalizeWeightValue(sourceWeights[key], 1);
+            if (weight !== 1) {
+                orderedWeights[lookup[key] || tag] = weight;
+            }
+        }
+    }
+
+    state.selectedTagWeights = orderedWeights;
+    setWidgetValue(state.selectedTagWeightsWidget, JSON.stringify(orderedWeights));
+
+    if (markDirty) {
+        node.setDirtyCanvas(true, true);
+        app.graph?.setDirtyCanvas?.(true, true);
+    }
+}
+
 function pruneSelectionByAvailability(state) {
     const available = new Set();
     for (const tags of Object.values(state.categories)) {
@@ -1714,6 +1916,22 @@ function pruneSelectedCategoryWeightsByAvailability(state) {
         next[resolved] = weight;
     }
     state.selectedCategoryWeights = next;
+}
+
+function pruneSelectedTagWeightsByAvailability(state) {
+    const lookup = buildAvailableTagLookup(state);
+    const next = {};
+    const seen = new Set();
+    for (const [tag, rawWeight] of Object.entries(state.selectedTagWeights || {})) {
+        const key = normalizeTag(tag);
+        const resolved = lookup[key];
+        if (!resolved || seen.has(key)) continue;
+        const weight = normalizeWeightValue(rawWeight, 1);
+        if (weight === 1) continue;
+        seen.add(key);
+        next[resolved] = weight;
+    }
+    state.selectedTagWeights = next;
 }
 
 function scheduleRefresh(node, delay = 420) {
@@ -2146,10 +2364,12 @@ async function refreshCategories(node) {
         pruneSelectionByAvailability(state);
         pruneCategorySelectionByAvailability(state);
         pruneSelectedCategoryWeightsByAvailability(state);
+        pruneSelectedTagWeightsByAvailability(state);
         updateCategoryOrderFromSelection(state);
         syncSelectedWidget(node, false);
         syncSelectedCategoriesWidget(node, false);
         syncSelectedCategoryWeightsWidget(node, false);
+        syncSelectedTagWeightsWidget(node, false);
 
         const count = Object.keys(state.categories).length;
         const statusKey = count > 0
@@ -2273,11 +2493,19 @@ function removeSelectedCategory(node, category) {
             }
         });
     }
+    if (state.selectedTagWeights && typeof state.selectedTagWeights === "object") {
+        Object.keys(state.selectedTagWeights).forEach(key => {
+            if (removeSet.has(normalizeTag(key))) {
+                delete state.selectedTagWeights[key];
+            }
+        });
+    }
 
     updateCategoryOrderFromSelection(state);
     syncSelectedWidget(node, false);
     syncSelectedCategoriesWidget(node, false);
-    syncSelectedCategoryWeightsWidget(node);
+    syncSelectedCategoryWeightsWidget(node, false);
+    syncSelectedTagWeightsWidget(node);
     renderAll(node);
 }
 
@@ -2318,6 +2546,69 @@ function setCategoryRowWeight(node, category, rawWeight) {
     syncSelectedCategoryWeightsWidget(node);
     renderPreview(node);
     return weight;
+}
+
+function setTagWeight(node, tag, rawWeight) {
+    const state = node.__dtsState;
+    if (!state) return 1;
+
+    const lookup = buildAvailableTagLookup(state);
+    const key = normalizeTag(tag);
+    const resolvedTag = lookup[key] || String(tag || "").trim();
+    if (!resolvedTag) return 1;
+
+    if (!state.selectedTagWeights || typeof state.selectedTagWeights !== "object") {
+        state.selectedTagWeights = {};
+    }
+
+    Object.keys(state.selectedTagWeights).forEach(existingTag => {
+        if (normalizeTag(existingTag) === key && existingTag !== resolvedTag) {
+            delete state.selectedTagWeights[existingTag];
+        }
+    });
+
+    const weight = normalizeWeightValue(rawWeight, 1);
+    if (weight === 1) {
+        delete state.selectedTagWeights[resolvedTag];
+    } else {
+        state.selectedTagWeights[resolvedTag] = weight;
+    }
+
+    syncSelectedTagWeightsWidget(node);
+    renderAll(node);
+    return weight;
+}
+
+function adjustTagWeight(node, tag, delta) {
+    const state = node.__dtsState;
+    if (!state) return 1;
+
+    const lookup = buildAvailableTagLookup(state);
+    const key = normalizeTag(tag);
+    const resolvedTag = lookup[key] || String(tag || "").trim();
+    const currentWeight = normalizeWeightValue(getResolvedSelectedTagWeights(state)[resolvedTag], 1);
+    return setTagWeight(node, resolvedTag, currentWeight + delta);
+}
+
+function resetCategoryTagWeights(node, category) {
+    const state = node.__dtsState;
+    if (!state) return;
+
+    const resolvedCategory = resolveCategoryName(state.categories || {}, category);
+    if (!resolvedCategory || !state.selectedTagWeights || typeof state.selectedTagWeights !== "object") return;
+
+    const removeSet = new Set((state.categories[resolvedCategory] || []).map(normalizeTag));
+    let changed = false;
+    Object.keys(state.selectedTagWeights).forEach(tag => {
+        if (removeSet.has(normalizeTag(tag))) {
+            delete state.selectedTagWeights[tag];
+            changed = true;
+        }
+    });
+    if (!changed) return;
+
+    syncSelectedTagWeightsWidget(node);
+    renderAll(node);
 }
 
 function renderCategoryFilter(node) {
@@ -2366,6 +2657,7 @@ function renderCategories(node) {
 
     const selectedSet = new Set(state.selected.map(normalizeTag));
     const selectedCategorySet = new Set((state.selectedCategories || []).map(normalizeCategory));
+    const tagWeights = getResolvedSelectedTagWeights(state);
 
     for (const category of names) {
         const card = document.createElement("div");
@@ -2401,9 +2693,16 @@ function renderCategories(node) {
         noneBtn.textContent = tr(state, "btn_none");
         noneBtn.onclick = () => clearCategory(node, category);
 
+        const resetWeightsBtn = document.createElement("button");
+        resetWeightsBtn.className = "dts-small";
+        resetWeightsBtn.textContent = tr(state, "btn_reset_tag_weights");
+        resetWeightsBtn.title = tr(state, "tag_weight_reset");
+        resetWeightsBtn.onclick = () => resetCategoryTagWeights(node, category);
+
         actions.appendChild(categoryBtn);
         actions.appendChild(allBtn);
         actions.appendChild(noneBtn);
+        actions.appendChild(resetWeightsBtn);
 
         head.appendChild(title);
         head.appendChild(actions);
@@ -2411,11 +2710,62 @@ function renderCategories(node) {
         const tagsBox = document.createElement("div");
         tagsBox.className = "dts-tags";
         categories[category].forEach(tag => {
+            const currentWeight = normalizeWeightValue(tagWeights[tag], 1);
             const chip = document.createElement("span");
             chip.className = "dts-tag";
             if (selectedSet.has(normalizeTag(tag))) chip.classList.add("dts-active");
-            chip.textContent = tag;
+            if (currentWeight !== 1) chip.classList.add("dts-tag-weighted");
             chip.onclick = () => toggleTag(node, tag);
+
+            const label = document.createElement("span");
+            label.className = "dts-tag-label";
+            label.textContent = tag;
+            chip.appendChild(label);
+
+            if (currentWeight !== 1) {
+                const badge = document.createElement("span");
+                badge.className = "dts-tag-badge";
+                badge.textContent = formatWeightValue(currentWeight);
+                badge.title = tr(state, "tag_weight_badge", { weight: formatWeightValue(currentWeight) });
+                chip.appendChild(badge);
+            }
+
+            const controls = document.createElement("span");
+            controls.className = "dts-tag-controls";
+
+            const increaseBtn = document.createElement("button");
+            increaseBtn.type = "button";
+            increaseBtn.className = "dts-tag-step";
+            increaseBtn.textContent = "+";
+            increaseBtn.title = tr(state, "tag_weight_up");
+            increaseBtn.setAttribute("aria-label", tr(state, "tag_weight_up"));
+            increaseBtn.onclick = event => {
+                event.preventDefault();
+                event.stopPropagation();
+                adjustTagWeight(node, tag, 0.05);
+            };
+
+            const decreaseBtn = document.createElement("button");
+            decreaseBtn.type = "button";
+            decreaseBtn.className = "dts-tag-step";
+            decreaseBtn.textContent = "-";
+            decreaseBtn.title = tr(state, "tag_weight_down");
+            decreaseBtn.setAttribute("aria-label", tr(state, "tag_weight_down"));
+            decreaseBtn.onclick = event => {
+                event.preventDefault();
+                event.stopPropagation();
+                adjustTagWeight(node, tag, -0.05);
+            };
+
+            [increaseBtn, decreaseBtn].forEach(btn => {
+                ["mousedown", "click", "pointerdown", "dblclick"].forEach(eventName => {
+                    btn.addEventListener(eventName, event => event.stopPropagation());
+                });
+            });
+
+            controls.appendChild(increaseBtn);
+            controls.appendChild(decreaseBtn);
+            chip.appendChild(controls);
             tagsBox.appendChild(chip);
         });
 
@@ -3317,6 +3667,7 @@ app.registerExtension({
             const selectedCategoriesWidget = getWidget(this, "selected_categories_json");
             const manualCategoryTagsWidget = getWidget(this, "manual_category_tags_json");
             const selectedCategoryWeightsWidget = getWidget(this, "selected_category_weights_json");
+            const selectedTagWeightsWidget = getWidget(this, "selected_tag_weights_json");
             const prefixWidget = getWidget(this, "prefix_text");
             const separatorWidget = getWidget(this, "separator");
             const useAllWidget = getWidget(this, "use_all_when_empty");
@@ -3338,7 +3689,7 @@ app.registerExtension({
 
             sanitizeLegacyWidgetValues(this);
 
-            [selectedWidget, selectedCategoriesWidget, manualCategoryTagsWidget, selectedCategoryWeightsWidget, prefixWidget, separatorWidget, useAllWidget, dedupeWidget, trailingWidget].forEach(hideWidget);
+            [selectedWidget, selectedCategoriesWidget, manualCategoryTagsWidget, selectedCategoryWeightsWidget, selectedTagWeightsWidget, prefixWidget, separatorWidget, useAllWidget, dedupeWidget, trailingWidget].forEach(hideWidget);
             if (isIntegratedNode) {
                 [
                     excelWidget,
@@ -3514,6 +3865,7 @@ app.registerExtension({
                 selectedCategoriesWidget,
                 manualCategoryTagsWidget,
                 selectedCategoryWeightsWidget,
+                selectedTagWeightsWidget,
                 prefixWidget,
                 separatorWidget,
                 useAllWidget,
@@ -3538,6 +3890,7 @@ app.registerExtension({
                 selectedCategories: parseSelected(selectedCategoriesWidget?.value),
                 manualCategoryTags: parseManualCategoryTags(manualCategoryTagsWidget?.value),
                 selectedCategoryWeights: parseSelectedCategoryWeights(selectedCategoryWeightsWidget?.value),
+                selectedTagWeights: parseSelectedTagWeights(selectedTagWeightsWidget?.value),
                 categoryOrder: [],
                 dragIndex: null,
                 refreshTimer: null,
@@ -3598,11 +3951,13 @@ app.registerExtension({
                 state.selectedCategories = [];
                 state.manualCategoryTags = {};
                 state.selectedCategoryWeights = {};
+                state.selectedTagWeights = {};
                 state.categoryOrder = [];
                 syncManualTagsWidget(this, false);
                 syncSelectedWidget(this, false);
                 syncSelectedCategoriesWidget(this, false);
-                syncSelectedCategoryWeightsWidget(this);
+                syncSelectedCategoryWeightsWidget(this, false);
+                syncSelectedTagWeightsWidget(this);
                 renderAll(this);
                 if (state.isIntegrated) {
                     scheduleRefresh(this, 120);
@@ -3660,6 +4015,7 @@ app.registerExtension({
             state.selectedCategories = parseSelected(state.selectedCategoriesWidget?.value);
             state.manualCategoryTags = parseManualCategoryTags(state.manualCategoryTagsWidget?.value);
             state.selectedCategoryWeights = parseSelectedCategoryWeights(state.selectedCategoryWeightsWidget?.value);
+            state.selectedTagWeights = parseSelectedTagWeights(state.selectedTagWeightsWidget?.value);
             applyManualTagsToCategories(state);
             syncSettingsFromWidgets(this);
             updateCategoryOrderFromSelection(state);
@@ -3680,6 +4036,7 @@ app.registerExtension({
                 "selected_categories_json",
                 "manual_category_tags_json",
                 "selected_category_weights_json",
+                "selected_tag_weights_json",
                 "prefix_text",
                 "separator",
                 "use_all_when_empty",
@@ -3716,8 +4073,11 @@ app.registerExtension({
                 if (widget.name === "selected_category_weights_json") {
                     state.selectedCategoryWeights = parseSelectedCategoryWeights(state.selectedCategoryWeightsWidget?.value);
                 }
+                if (widget.name === "selected_tag_weights_json") {
+                    state.selectedTagWeights = parseSelectedTagWeights(state.selectedTagWeightsWidget?.value);
+                }
                 syncSettingsFromWidgets(this);
-                if (widget.name === "selected_tags_json" || widget.name === "selected_categories_json" || widget.name === "manual_category_tags_json" || widget.name === "selected_category_weights_json") {
+                if (widget.name === "selected_tags_json" || widget.name === "selected_categories_json" || widget.name === "manual_category_tags_json" || widget.name === "selected_category_weights_json" || widget.name === "selected_tag_weights_json") {
                     renderAll(this);
                 } else {
                     renderPreview(this);

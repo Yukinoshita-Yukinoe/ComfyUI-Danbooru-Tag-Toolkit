@@ -1001,6 +1001,7 @@ def _select_from_bundle(
     selected_categories_json: Any,
     manual_category_tags_json: Any,
     selected_category_weights_json: Any,
+    selected_tag_weights_json: Any,
     separator: str,
     use_all_when_empty: bool,
     deduplicate_selected: bool,
@@ -1011,6 +1012,7 @@ def _select_from_bundle(
     selected_list = _safe_parse_json_list(selected_tags_json, [])
     selected_categories = _safe_parse_json_list(selected_categories_json, [])
     selected_category_weights = _safe_parse_json_weight_map(selected_category_weights_json)
+    selected_tag_weights = _safe_parse_json_weight_map(selected_tag_weights_json)
     use_all_when_empty = _as_bool(use_all_when_empty, True)
     deduplicate_selected = _as_bool(deduplicate_selected, True)
     normalized_separator = str(separator or "comma").strip()
@@ -1058,6 +1060,13 @@ def _select_from_bundle(
         if not resolved_category:
             continue
         resolved_category_weights[resolved_category] = weight
+
+    resolved_tag_weights: Dict[str, float] = {}
+    for raw_tag, weight in selected_tag_weights.items():
+        normalized_key = _unescape_comfy_parentheses(raw_tag).strip().lower()
+        if not normalized_key or normalized_key not in available_map:
+            continue
+        resolved_tag_weights[normalized_key] = weight
 
     category_order: List[str] = []
     seen_category_order = set()
@@ -1123,12 +1132,31 @@ def _select_from_bundle(
             if not row_tags:
                 continue
 
-            row_text = ", ".join(row_tags)
             row_weight = resolved_category_weights.get(category, 1.0)
             if abs(float(row_weight) - 1.0) > 1e-9:
-                selected_parts.append(f"({row_text}:{_format_prompt_weight(row_weight)})")
+                weighted_parts: List[str] = []
+                remaining_tags: List[str] = []
+                for escaped_tag in row_tags:
+                    normalized_key = _unescape_comfy_parentheses(escaped_tag).strip().lower()
+                    tag_weight = resolved_tag_weights.get(normalized_key, 1.0)
+                    if abs(float(tag_weight) - 1.0) > 1e-9:
+                        weighted_parts.append(_build_weighted_prompt_part([escaped_tag], tag_weight))
+                    else:
+                        remaining_tags.append(escaped_tag)
+                selected_parts.extend([part for part in weighted_parts if part])
+                grouped_part = _build_weighted_prompt_part(remaining_tags, row_weight)
+                if grouped_part:
+                    selected_parts.append(grouped_part)
             else:
-                selected_parts.append(row_text)
+                for escaped_tag in row_tags:
+                    normalized_key = _unescape_comfy_parentheses(escaped_tag).strip().lower()
+                    tag_weight = resolved_tag_weights.get(normalized_key, 1.0)
+                    if abs(float(tag_weight) - 1.0) > 1e-9:
+                        weighted_tag = _build_weighted_prompt_part([escaped_tag], tag_weight)
+                        if weighted_tag:
+                            selected_parts.append(weighted_tag)
+                    else:
+                        selected_parts.append(escaped_tag)
 
         fallback_seen = set()
         for tag in fallback_tags:
@@ -1140,7 +1168,13 @@ def _select_from_bundle(
             fallback_seen.add(normalized_tag)
             if deduplicate_selected:
                 used_tag_keys.add(normalized_tag)
-            selected_parts.append(tag)
+            tag_weight = resolved_tag_weights.get(normalized_tag, 1.0)
+            if abs(float(tag_weight) - 1.0) > 1e-9:
+                weighted_tag = _build_weighted_prompt_part([tag], tag_weight)
+                if weighted_tag:
+                    selected_parts.append(weighted_tag)
+            else:
+                selected_parts.append(tag)
     elif use_all_when_empty:
         selected_parts = [
             _escape_unescaped_parentheses(str(tag).strip())
@@ -1670,6 +1704,7 @@ class DanbooruTagSorterSelectorNode:
                 "selected_categories_json": ("STRING", {"default": "[]", "multiline": True}),
                 "manual_category_tags_json": ("STRING", {"default": "{}", "multiline": True}),
                 "selected_category_weights_json": ("STRING", {"default": "{}", "multiline": True}),
+                "selected_tag_weights_json": ("STRING", {"default": "{}", "multiline": True}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -1704,6 +1739,7 @@ class DanbooruTagSorterSelectorNode:
         selected_categories_json="[]",
         manual_category_tags_json="{}",
         selected_category_weights_json="{}",
+        selected_tag_weights_json="{}",
         unique_id=None,
     ):
         all_str, cat_dict, _, _, _ = _execute_sorting(
@@ -1726,6 +1762,7 @@ class DanbooruTagSorterSelectorNode:
             selected_categories_json=selected_categories_json,
             manual_category_tags_json=manual_category_tags_json,
             selected_category_weights_json=selected_category_weights_json,
+            selected_tag_weights_json=selected_tag_weights_json,
             separator=separator,
             use_all_when_empty=use_all_when_empty,
             deduplicate_selected=deduplicate_selected,
