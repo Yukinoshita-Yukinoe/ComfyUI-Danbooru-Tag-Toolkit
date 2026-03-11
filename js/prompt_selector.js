@@ -82,6 +82,29 @@ function migrateCategoriesToId(promptData) {
 // 数据同步管理器 - 处理多节点间的数据同步和智能合并
 // ============================================================================
 
+function captureScrollState(container, renderKey = "") {
+    if (!container) return null;
+    return {
+        top: container.scrollTop,
+        left: container.scrollLeft,
+        renderKey: String(renderKey || ""),
+    };
+}
+
+function restoreScrollState(container, state, renderKey = "") {
+    if (!container || !state) return;
+    if (String(state.renderKey || "") !== String(renderKey || "")) return;
+
+    const apply = () => {
+        const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
+        container.scrollTop = Math.min(Math.max(0, state.top || 0), maxTop);
+        container.scrollLeft = Math.max(0, state.left || 0);
+    };
+
+    apply();
+    requestAnimationFrame(apply);
+}
+
 /**
  * 提示词数据同步管理器
  *
@@ -1366,6 +1389,11 @@ app.registerExtension({
                 this.renderContent = () => {
                     const contentArea = mainContainer.querySelector(".prompt-selector-content-area");
                     if (!contentArea) return;
+                    const renderKey = JSON.stringify({
+                        category: this.selectedCategory || '',
+                        search: (this.searchTerm || '').trim().toLowerCase(),
+                    });
+                    const previousScrollState = captureScrollState(contentArea, renderKey);
                     contentArea.innerHTML = ''; // Clear it
 
                     if (!this.promptData) {
@@ -1711,6 +1739,7 @@ app.registerExtension({
                     });
 
                     contentArea.appendChild(list);
+                    restoreScrollState(contentArea, previousScrollState, renderKey);
                     this.updateSelectAllButtonState();
                 };
 
@@ -3971,8 +4000,17 @@ app.registerExtension({
                     if (!modal) return;
                     const promptListContainer = modal.querySelector('.ps-prompt-list-container');
                     if (!promptListContainer) return;
+                    const searchInputEl = modal.querySelector('#ps-library-search-input');
+                    const currentSearchTerm = (searchInputEl?.value || '').toLowerCase();
+                    const renderKey = JSON.stringify({
+                        category: categoryName || '',
+                        search: currentSearchTerm,
+                        favorites: Boolean(this.currentFilter?.favorites),
+                        tags: Array.isArray(this.currentFilter?.tags) ? [...this.currentFilter.tags].sort() : [],
+                    });
+                    const previousScrollState = captureScrollState(promptListContainer, renderKey);
 
-                    promptListContainer.innerHTML = ''; // 清空
+                    promptListContainer.innerHTML = ''; // clear and rerender
                     let promptsToShow = [];
                     const isParentCategory = categoryName && categoryName !== "__favorites__" && this.promptData.categories.some(c => c.name.startsWith(categoryName + '/'));
 
@@ -3992,7 +4030,6 @@ app.registerExtension({
                     }
 
                     // 应用搜索过滤
-                    const currentSearchTerm = modal.querySelector('#ps-library-search-input').value.toLowerCase();
                     if (currentSearchTerm) {
                         if (!categoryName) { // If searching globally
                             promptsToShow = this.promptData.categories.flatMap(c => c.prompts);
@@ -4231,6 +4268,7 @@ app.registerExtension({
                     });
 
                     promptListContainer.appendChild(list);
+                    restoreScrollState(promptListContainer, previousScrollState, renderKey);
                     if (promptsToShow.length) {
                         const currentPromptId = this.currentPreviewPrompt?.id;
                         const currentStillExists = currentPromptId && promptsToShow.some(prompt => prompt.id === currentPromptId);
