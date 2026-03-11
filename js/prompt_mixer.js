@@ -109,6 +109,29 @@ function injectStyle() {
             align-items: center;
             gap: 6px;
             max-width: 100%;
+            position: relative;
+        }
+        .dtm-chip.dtm-dragging {
+            opacity: .55;
+            border-style: dashed;
+            cursor: grabbing;
+        }
+        .dtm-chip.dtm-drop-before::before,
+        .dtm-chip.dtm-drop-after::after {
+            content: "";
+            position: absolute;
+            top: -3px;
+            bottom: -3px;
+            width: 2px;
+            border-radius: 999px;
+            background: #ffd08b;
+            box-shadow: 0 0 0 1px rgba(255, 208, 139, .18);
+        }
+        .dtm-chip.dtm-drop-before::before {
+            left: -4px;
+        }
+        .dtm-chip.dtm-drop-after::after {
+            right: -4px;
         }
         .dtm-chip:hover {
             border-color: #83a9db;
@@ -121,6 +144,21 @@ function injectStyle() {
         .dtm-chip.dtm-weighted {
             border-color: #d7a461;
             box-shadow: inset 0 0 0 1px rgba(215, 164, 97, .12);
+        }
+        .dtm-chip-handle {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 12px;
+            color: #8da9cd;
+            cursor: grab;
+            font-size: 10px;
+            line-height: 1;
+            letter-spacing: -.5px;
+            flex: 0 0 auto;
+        }
+        .dtm-chip-handle:hover {
+            color: #d8e7ff;
         }
         .dtm-chip-label {
             min-width: 0;
@@ -415,6 +453,29 @@ function parseSelected(rawValue) {
     return result;
 }
 
+function parseTagOrder(rawValue) {
+    if (!rawValue) return [];
+    let parsed = rawValue;
+    if (typeof rawValue === "string") {
+        try {
+            parsed = JSON.parse(rawValue);
+        } catch {
+            return [];
+        }
+    }
+    if (!Array.isArray(parsed)) return [];
+
+    const result = [];
+    const seen = new Set();
+    parsed.forEach(tag => {
+        const key = normalizeTag(tag);
+        if (!key || seen.has(key)) return;
+        seen.add(key);
+        result.push(key);
+    });
+    return result;
+}
+
 function parseSelectedTagWeights(rawValue) {
     if (!rawValue) return {};
     let parsed = rawValue;
@@ -522,6 +583,105 @@ function parsePromptItems(rawPrompt) {
     return items;
 }
 
+function applyStoredTagOrder(items, tagOrder) {
+    const normalizedOrder = Array.isArray(tagOrder) ? tagOrder : [];
+    if (!normalizedOrder.length) return [...items];
+
+    const lookup = new Map(items.map(item => [item.key, item]));
+    const orderedItems = [];
+    const seen = new Set();
+
+    normalizedOrder.forEach(key => {
+        const normalizedKey = normalizeTag(key);
+        const item = lookup.get(normalizedKey);
+        if (!item || seen.has(normalizedKey)) return;
+        seen.add(normalizedKey);
+        orderedItems.push(item);
+    });
+
+    items.forEach(item => {
+        if (seen.has(item.key)) return;
+        seen.add(item.key);
+        orderedItems.push(item);
+    });
+
+    return orderedItems;
+}
+
+function moveParsedItem(items, draggedKey, targetKey = null, position = "after") {
+    const nextItems = [...(items || [])];
+    const fromIndex = nextItems.findIndex(item => item.key === draggedKey);
+    if (fromIndex < 0) return nextItems;
+
+    const [draggedItem] = nextItems.splice(fromIndex, 1);
+    if (!targetKey) {
+        nextItems.push(draggedItem);
+        return nextItems;
+    }
+
+    let toIndex = nextItems.findIndex(item => item.key === targetKey);
+    if (toIndex < 0) {
+        nextItems.push(draggedItem);
+        return nextItems;
+    }
+    if (position === "after") {
+        toIndex += 1;
+    }
+    nextItems.splice(toIndex, 0, draggedItem);
+    return nextItems;
+}
+
+function getChipDropPosition(event, element) {
+    const rect = element.getBoundingClientRect();
+    const centerX = rect.left + (rect.width / 2);
+    const centerY = rect.top + (rect.height / 2);
+    const deltaX = Math.abs(event.clientX - centerX);
+    const deltaY = Math.abs(event.clientY - centerY);
+    if (deltaY > (deltaX * 1.2)) {
+        return event.clientY < centerY ? "before" : "after";
+    }
+    return event.clientX < centerX ? "before" : "after";
+}
+
+function clearChipDropState(state) {
+    if (!state?.tagsEl) return;
+    state.tagsEl.querySelectorAll(".dtm-drop-before, .dtm-drop-after").forEach(element => {
+        element.classList.remove("dtm-drop-before", "dtm-drop-after");
+    });
+    state.dragTargetKey = null;
+    state.dragTargetPosition = "after";
+}
+
+function clearMixerDragState(state) {
+    if (!state) return;
+    clearChipDropState(state);
+    if (state.draggedChipEl) {
+        state.draggedChipEl.classList.remove("dtm-dragging");
+    }
+    state.draggedChipEl = null;
+    state.draggedKey = null;
+}
+
+function commitMixerDrag(node, targetKey = null, position = "after") {
+    const state = node.__dtmState;
+    if (!state?.draggedKey) return;
+
+    const nextItems = moveParsedItem(state.parsedItems || [], state.draggedKey, targetKey, position);
+    const changed = JSON.stringify(nextItems.map(item => item.key)) !== JSON.stringify((state.parsedItems || []).map(item => item.key));
+
+    clearMixerDragState(state);
+
+    if (!changed) {
+        renderAll(node);
+        return;
+    }
+
+    state.parsedItems = nextItems;
+    state.tagOrder = nextItems.map(item => item.key);
+    syncStateWidgets(node, false);
+    renderAll(node);
+}
+
 function buildPromptOutput(state) {
     const parts = [];
     const selectedSet = new Set((state.selected || []).map(normalizeTag));
@@ -563,10 +723,10 @@ function syncStateWidgets(node, markDirty = true) {
     const state = node.__dtmState;
     if (!state) return;
 
-    const lookup = new Map((state.parsedItems || []).map(item => [item.key, item]));
+    const orderedItems = [...(state.parsedItems || [])];
     const orderedSelected = [];
     const seen = new Set();
-    for (const item of state.parsedItems || []) {
+    for (const item of orderedItems) {
         if (!state.selectedSet.has(item.key) || seen.has(item.key)) continue;
         seen.add(item.key);
         orderedSelected.push(item.tag);
@@ -574,18 +734,21 @@ function syncStateWidgets(node, markDirty = true) {
 
     const resolvedWeights = getResolvedSelectedTagWeights(state);
     const orderedWeights = {};
-    for (const item of state.parsedItems || []) {
+    for (const item of orderedItems) {
         const weight = normalizeWeightValue(resolvedWeights[item.tag], item.baseWeight);
         if (weight !== item.baseWeight) {
             orderedWeights[item.tag] = weight;
         }
     }
 
+    const serializedOrder = orderedItems.map(item => item.tag);
     state.selected = orderedSelected;
     state.selectedTagWeights = orderedWeights;
+    state.tagOrder = orderedItems.map(item => item.key);
     setWidgetValue(state.selectedWidget, JSON.stringify(orderedSelected));
     setWidgetValue(state.selectedTagWeightsWidget, JSON.stringify(orderedWeights));
-    setWidgetValue(state.selectionInitializedWidget, Boolean(state.selectionInitialized && (state.parsedItems || []).length > 0));
+    setWidgetValue(state.tagOrderWidget, JSON.stringify(serializedOrder));
+    setWidgetValue(state.selectionInitializedWidget, Boolean(state.selectionInitialized && orderedItems.length > 0));
 
     if (markDirty) {
         node.setDirtyCanvas(true, true);
@@ -646,16 +809,19 @@ function reconcileStateFromPrompt(node) {
 
     const previousKeys = new Set((state.parsedItems || []).map(item => item.key));
     const previousSelected = new Set((state.selected || []).map(normalizeTag));
-    const parsedItems = parsePromptItems(getPromptSourceText(node));
+    const parsedItems = applyStoredTagOrder(parsePromptItems(getPromptSourceText(node)), state.tagOrder);
     const itemLookup = new Map(parsedItems.map(item => [item.key, item]));
 
     state.parsedItems = parsedItems;
+    state.tagOrder = parsedItems.map(item => item.key);
 
     if (!parsedItems.length) {
         state.selectionInitialized = false;
         state.selectedSet = new Set();
         state.selected = [];
         state.selectedTagWeights = {};
+        state.tagOrder = [];
+        clearMixerDragState(state);
         syncStateWidgets(node, false);
         renderAll(node);
         return;
@@ -699,7 +865,10 @@ function renderAll(node) {
     if (!state) return;
 
     const parsedItems = state.parsedItems || [];
+    const previousScrollTop = state.tagsEl?.scrollTop || 0;
+    const previousScrollLeft = state.tagsEl?.scrollLeft || 0;
     state.tagsEl.innerHTML = "";
+    clearChipDropState(state);
 
     const resolvedWeights = getResolvedSelectedTagWeights(state);
     const selectedCount = parsedItems.filter(item => state.selectedSet.has(item.key)).length;
@@ -718,6 +887,7 @@ function renderAll(node) {
         const currentWeight = normalizeWeightValue(resolvedWeights[item.tag], item.baseWeight);
         const chip = document.createElement("span");
         chip.className = "dtm-chip";
+        chip.dataset.key = item.key;
         if (state.selectedSet.has(item.key)) chip.classList.add("dtm-active");
         if (currentWeight !== 1) chip.classList.add("dtm-weighted");
         chip.onclick = () => {
@@ -726,6 +896,52 @@ function renderAll(node) {
             syncStateWidgets(node, false);
             renderAll(node);
         };
+
+        chip.addEventListener("dragover", event => {
+            if (!state.draggedKey || state.draggedKey === item.key) return;
+            event.preventDefault();
+            if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+            const position = getChipDropPosition(event, chip);
+            clearChipDropState(state);
+            state.dragTargetKey = item.key;
+            state.dragTargetPosition = position;
+            chip.classList.add(position === "before" ? "dtm-drop-before" : "dtm-drop-after");
+        });
+
+        chip.addEventListener("drop", event => {
+            if (!state.draggedKey) return;
+            event.preventDefault();
+            if (state.draggedKey === item.key) {
+                clearMixerDragState(state);
+                renderAll(node);
+                return;
+            }
+            commitMixerDrag(node, item.key, getChipDropPosition(event, chip));
+        });
+
+        const handle = document.createElement("span");
+        handle.className = "dtm-chip-handle";
+        handle.textContent = "::";
+        handle.title = "Drag to reorder";
+        handle.draggable = true;
+        ["click", "dblclick", "mousedown", "pointerdown"].forEach(eventName => {
+            handle.addEventListener(eventName, event => event.stopPropagation());
+        });
+        handle.addEventListener("dragstart", event => {
+            clearMixerDragState(state);
+            state.draggedKey = item.key;
+            state.draggedChipEl = chip;
+            chip.classList.add("dtm-dragging");
+            if (event.dataTransfer) {
+                event.dataTransfer.effectAllowed = "move";
+                event.dataTransfer.setData("text/plain", item.key);
+            }
+        });
+        handle.addEventListener("dragend", () => {
+            clearMixerDragState(state);
+            renderAll(node);
+        });
+        chip.appendChild(handle);
 
         const label = document.createElement("span");
         label.className = "dtm-chip-label";
@@ -783,6 +999,14 @@ function renderAll(node) {
         chip.appendChild(controls);
         state.tagsEl.appendChild(chip);
     });
+
+    const restoreScroll = () => {
+        const maxTop = Math.max(0, state.tagsEl.scrollHeight - state.tagsEl.clientHeight);
+        state.tagsEl.scrollTop = Math.min(previousScrollTop, maxTop);
+        state.tagsEl.scrollLeft = Math.max(0, previousScrollLeft);
+    };
+    restoreScroll();
+    requestAnimationFrame(restoreScroll);
 }
 
 function syncRootLayout(node) {
@@ -811,9 +1035,10 @@ app.registerExtension({
             const promptWidget = getWidget(this, "prompt");
             const selectedWidget = getWidget(this, "selected_tags_json");
             const selectedTagWeightsWidget = getWidget(this, "selected_tag_weights_json");
+            const tagOrderWidget = getWidget(this, "tag_order_json");
             const selectionInitializedWidget = getWidget(this, "selection_initialized");
 
-            [selectedWidget, selectedTagWeightsWidget, selectionInitializedWidget].forEach(hideWidget);
+            [selectedWidget, selectedTagWeightsWidget, tagOrderWidget, selectionInitializedWidget].forEach(hideWidget);
             hideWidget(promptWidget);
 
             const root = document.createElement("div");
@@ -879,6 +1104,7 @@ app.registerExtension({
                 promptWidget,
                 selectedWidget,
                 selectedTagWeightsWidget,
+                tagOrderWidget,
                 selectionInitializedWidget,
                 tagsEl,
                 previewEl,
@@ -887,9 +1113,30 @@ app.registerExtension({
                 selected: parseSelected(selectedWidget?.value),
                 selectedSet: new Set(parseSelected(selectedWidget?.value).map(normalizeTag)),
                 selectedTagWeights: parseSelectedTagWeights(selectedTagWeightsWidget?.value),
+                tagOrder: parseTagOrder(tagOrderWidget?.value),
                 selectionInitialized: normalizeBooleanValue(selectionInitializedWidget?.value, false),
                 latestPrompt: "",
+                draggedKey: null,
+                draggedChipEl: null,
+                dragTargetKey: null,
+                dragTargetPosition: "after",
             };
+
+            tagsEl.addEventListener("dragover", event => {
+                const state = this.__dtmState;
+                if (!state?.draggedKey) return;
+                if (event.target.closest(".dtm-chip")) return;
+                event.preventDefault();
+                clearChipDropState(state);
+                if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+            });
+            tagsEl.addEventListener("drop", event => {
+                const state = this.__dtmState;
+                if (!state?.draggedKey) return;
+                if (event.target.closest(".dtm-chip")) return;
+                event.preventDefault();
+                commitMixerDrag(this, null, "after");
+            });
 
             refreshBtn.onclick = () => {
                 refreshPromptPreview(this);
@@ -927,6 +1174,7 @@ app.registerExtension({
             state.selected = parseSelected(state.selectedWidget?.value);
             state.selectedSet = new Set(state.selected.map(normalizeTag));
             state.selectedTagWeights = parseSelectedTagWeights(state.selectedTagWeightsWidget?.value);
+            state.tagOrder = parseTagOrder(state.tagOrderWidget?.value);
             state.selectionInitialized = normalizeBooleanValue(state.selectionInitializedWidget?.value, false);
             reconcileStateFromPrompt(this);
             if (isPromptLinked(this)) {
@@ -958,6 +1206,13 @@ app.registerExtension({
 
             if (widget?.name === "selected_tag_weights_json") {
                 state.selectedTagWeights = parseSelectedTagWeights(state.selectedTagWeightsWidget?.value);
+                renderAll(this);
+                return result;
+            }
+
+            if (widget?.name === "tag_order_json") {
+                state.tagOrder = parseTagOrder(state.tagOrderWidget?.value);
+                state.parsedItems = applyStoredTagOrder(state.parsedItems || [], state.tagOrder);
                 renderAll(this);
                 return result;
             }

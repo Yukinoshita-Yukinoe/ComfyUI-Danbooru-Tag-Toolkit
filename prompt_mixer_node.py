@@ -77,13 +77,51 @@ def _parse_prompt_mixer_items(raw_prompt: Any) -> List[Dict[str, Any]]:
     return items
 
 
+def _apply_prompt_mixer_order(items: List[Dict[str, Any]], tag_order_json: Any) -> List[Dict[str, Any]]:
+    if not items:
+        return []
+
+    ordered_keys: List[str] = []
+    seen = set()
+    for raw_tag in _safe_parse_json_list(tag_order_json, []):
+        normalized_key = _normalize_mixer_tag(raw_tag)
+        if not normalized_key or normalized_key in seen:
+            continue
+        seen.add(normalized_key)
+        ordered_keys.append(normalized_key)
+
+    if not ordered_keys:
+        return list(items)
+
+    item_lookup = {item["key"]: item for item in items}
+    ordered_items: List[Dict[str, Any]] = []
+    consumed = set()
+
+    for key in ordered_keys:
+        item = item_lookup.get(key)
+        if item is None or key in consumed:
+            continue
+        consumed.add(key)
+        ordered_items.append(item)
+
+    for item in items:
+        key = str(item.get("key") or "")
+        if not key or key in consumed:
+            continue
+        consumed.add(key)
+        ordered_items.append(item)
+
+    return ordered_items
+
+
 def _build_prompt_mixer_output(
     prompt: Any,
     selected_tags_json: Any,
     selected_tag_weights_json: Any,
     selection_initialized: Any,
+    tag_order_json: Any,
 ) -> str:
-    items = _parse_prompt_mixer_items(prompt)
+    items = _apply_prompt_mixer_order(_parse_prompt_mixer_items(prompt), tag_order_json)
     if not items:
         return ""
 
@@ -141,6 +179,7 @@ class DanbooruPromptMixerNode:
                 }),
                 "selected_tags_json": ("STRING", {"default": "[]", "multiline": True}),
                 "selected_tag_weights_json": ("STRING", {"default": "{}", "multiline": True}),
+                "tag_order_json": ("STRING", {"default": "[]", "multiline": True}),
                 "selection_initialized": ("BOOLEAN", {"default": False}),
             },
             "hidden": {
@@ -158,6 +197,7 @@ class DanbooruPromptMixerNode:
         prompt="",
         selected_tags_json="[]",
         selected_tag_weights_json="{}",
+        tag_order_json="[]",
         selection_initialized=False,
         unique_id=None,
     ):
@@ -169,6 +209,7 @@ class DanbooruPromptMixerNode:
                 selected_tags_json=selected_tags_json,
                 selected_tag_weights_json=selected_tag_weights_json,
                 selection_initialized=selection_initialized,
+                tag_order_json=tag_order_json,
             ),
         )
 
