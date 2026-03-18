@@ -405,13 +405,31 @@ function getWidget(node, name) {
     return node?.widgets?.find(w => w?.name === name);
 }
 
-function hideWidget(widget) {
-    if (!widget) return;
+function hideWidget(widget, suffix = "") {
+    if (!widget || widget.__dtgHidden) return;
+    widget.__dtgHidden = true;
+    widget.origType ??= widget.type;
+    widget.origComputeSize ??= widget.computeSize;
+    widget.type = `converted-widget${suffix}`;
     widget.computeSize = () => [0, -4];
-    widget.type = "hidden";
     widget.hidden = true;
     widget.serialize = true;
     widget.draw = () => {};
+
+    const domWrapper = widget.inputEl?.closest?.(".dom-widget") ?? widget.inputEl ?? null;
+    if (domWrapper) {
+        domWrapper.hidden = true;
+        domWrapper.style.display = "none";
+        domWrapper.style.opacity = "0";
+        domWrapper.style.maxHeight = "0";
+        domWrapper.style.minHeight = "0";
+        domWrapper.style.height = "0";
+        domWrapper.style.pointerEvents = "none";
+    }
+
+    widget.linkedWidgets?.forEach(linkedWidget => {
+        hideWidget(linkedWidget, `:${widget.name || suffix}`);
+    });
 }
 
 function parseSelectionData(rawValue) {
@@ -857,11 +875,15 @@ app.registerExtension({
             const clearCacheBtn = document.createElement("button");
             clearCacheBtn.className = "dtg-btn";
             clearCacheBtn.textContent = "Clear Cache";
+            const selectPageBtn = document.createElement("button");
+            selectPageBtn.className = "dtg-btn";
+            selectPageBtn.textContent = "Select Page";
             const clearBtn = document.createElement("button");
             clearBtn.className = "dtg-btn";
             clearBtn.textContent = "Clear Selection";
             bottom.appendChild(summaryEl);
             actionWrap.appendChild(clearCacheBtn);
+            actionWrap.appendChild(selectPageBtn);
             actionWrap.appendChild(clearBtn);
             bottom.appendChild(actionWrap);
 
@@ -1139,6 +1161,23 @@ app.registerExtension({
                 updateSummary();
             }
 
+            function buildSelectionPayload(post) {
+                const selectedCategories = getSelectedCategories();
+                return {
+                    post_id: post.id,
+                    display_url: post.display_url || post.image_url || post.preview_url || "",
+                    image_url: post.image_url || post.preview_url || "",
+                    preview_url: post.preview_url || "",
+                    tag_string: post.tag_string || "",
+                    tag_string_artist: post.tag_string_artist || "",
+                    tag_string_copyright: post.tag_string_copyright || "",
+                    tag_string_character: post.tag_string_character || "",
+                    tag_string_general: post.tag_string_general || "",
+                    tag_string_meta: post.tag_string_meta || "",
+                    prompt: buildPromptLikeReference(post, selectedCategories),
+                };
+            }
+
             function resizeMasonryCard(card) {
                 if (!card) return;
                 const gridStyle = window.getComputedStyle(state.grid);
@@ -1230,20 +1269,7 @@ app.registerExtension({
 
                     card.onclick = () => {
                         const alreadySelected = state.selectedMap.has(post.id);
-                        const prompt = buildPromptLikeReference(post, getSelectedCategories());
-                        const payload = {
-                            post_id: post.id,
-                            display_url: post.display_url || post.image_url || post.preview_url || "",
-                            image_url: post.image_url || post.preview_url || "",
-                            preview_url: post.preview_url || "",
-                            tag_string: post.tag_string || "",
-                            tag_string_artist: post.tag_string_artist || "",
-                            tag_string_copyright: post.tag_string_copyright || "",
-                            tag_string_character: post.tag_string_character || "",
-                            tag_string_general: post.tag_string_general || "",
-                            tag_string_meta: post.tag_string_meta || "",
-                            prompt,
-                        };
+                        const payload = buildSelectionPayload(post);
 
                         if (alreadySelected) {
                             state.selectedMap.delete(post.id);
@@ -1399,6 +1425,15 @@ app.registerExtension({
             goBtn.onclick = commitPageJump;
             clearCacheBtn.onclick = () => {
                 clearServerCache();
+            };
+            selectPageBtn.onclick = () => {
+                state.posts.forEach(post => {
+                    if (!post?.id) return;
+                    state.selectedMap.set(post.id, buildSelectionPayload(post));
+                });
+                saveSelection();
+                syncStateWidget(false);
+                renderPosts();
             };
             clearBtn.onclick = () => {
                 state.selectedMap.clear();

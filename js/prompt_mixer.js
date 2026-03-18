@@ -224,11 +224,40 @@ function injectStyle() {
     document.head.appendChild(style);
 }
 
-function hideWidget(widget) {
-    if (!widget) return;
-    widget.type = "hidden";
+function hideWidget(widget, suffix = "") {
+    if (!widget || widget.__dtmHidden) return;
+    widget.__dtmHidden = true;
+    widget.origType ??= widget.type;
+    widget.origComputeSize ??= widget.computeSize;
+    widget.type = `converted-widget${suffix}`;
+    widget.hidden = true;
+    widget.serialize = true;
     widget.computeSize = () => [0, -4];
     widget.draw = () => {};
+
+    const domWrapper = widget.inputEl?.closest?.(".dom-widget") ?? widget.inputEl ?? null;
+    if (domWrapper) {
+        domWrapper.hidden = true;
+        domWrapper.style.display = "none";
+        domWrapper.style.opacity = "0";
+        domWrapper.style.maxHeight = "0";
+        domWrapper.style.minHeight = "0";
+        domWrapper.style.height = "0";
+        domWrapper.style.pointerEvents = "none";
+    }
+
+    widget.linkedWidgets?.forEach(linkedWidget => {
+        hideWidget(linkedWidget, `:${widget.name || suffix}`);
+    });
+}
+
+function hideWidgetsByName(node, widgetNames) {
+    const names = new Set(widgetNames);
+    (node?.widgets || []).forEach(widget => {
+        if (names.has(widget?.name)) {
+            hideWidget(widget);
+        }
+    });
 }
 
 function compactPromptWidget(widget) {
@@ -1016,7 +1045,18 @@ function syncRootLayout(node) {
     const width = Math.max(280, Math.floor(node.size?.[0] || 430));
     const height = Math.max(220, Math.floor(node.size?.[1] || 320));
     const innerWidth = Math.max(260, width - 22);
-    const innerHeight = Math.max(180, height - 22);
+    const measuredTop = Number(state.domWidgetEl?.offsetTop || state.rootEl?.offsetTop || 0);
+    const widgetTop = Math.max(
+        72,
+        measuredTop,
+    );
+    const innerHeight = Math.max(160, height - widgetTop - 20);
+    if (state.domWidgetEl) {
+        state.domWidgetEl.style.height = `${innerHeight}px`;
+        state.domWidgetEl.style.maxHeight = `${innerHeight}px`;
+        state.domWidgetEl.style.overflow = "hidden";
+        state.domWidgetEl.style.boxSizing = "border-box";
+    }
     state.rootEl.style.width = `${innerWidth}px`;
     state.rootEl.style.maxWidth = `${innerWidth}px`;
     state.rootEl.style.setProperty("--dtm-root-h", `${innerHeight}px`);
@@ -1093,14 +1133,39 @@ app.registerExtension({
                 this.widgets.splice(insertAt, 0, domWidget);
             }
 
+            hideWidgetsByName(this, [
+                "prompt",
+                "selected_tags_json",
+                "selected_tag_weights_json",
+                "tag_order_json",
+                "selection_initialized",
+            ]);
+
             this.color = TITLE_COLOR;
             this.bgcolor = BODY_COLOR;
-            if ((this.size?.[0] || 0) < 380 || (this.size?.[1] || 0) < 240) {
-                this.size = [380, 240];
+            const minNodeWidth = 400;
+            const minNodeHeight = 260;
+            const defaultNodeWidth = 420;
+            const defaultNodeHeight = 320;
+            const currentWidth = Math.floor(this.size?.[0] || 0);
+            const currentHeight = Math.floor(this.size?.[1] || 0);
+            const looksLegacyTallLayout =
+                currentWidth > 0
+                && currentHeight > 0
+                && currentWidth <= 720
+                && currentHeight >= 700;
+            if (looksLegacyTallLayout) {
+                this.size = [Math.max(minNodeWidth, currentWidth), defaultNodeHeight];
+            } else if (currentWidth < minNodeWidth || currentHeight < minNodeHeight) {
+                this.size = [
+                    Math.max(minNodeWidth, currentWidth || defaultNodeWidth),
+                    Math.max(minNodeHeight, currentHeight || defaultNodeHeight),
+                ];
             }
 
             this.__dtmState = {
                 rootEl: root,
+                domWidgetEl: domWidget?.element || null,
                 promptWidget,
                 selectedWidget,
                 selectedTagWeightsWidget,
@@ -1157,11 +1222,13 @@ app.registerExtension({
                 renderAll(this);
             };
 
-            reconcileStateFromPrompt(this);
             if (isPromptLinked(this)) {
                 refreshPromptPreview(this);
+            } else {
+                reconcileStateFromPrompt(this);
             }
             syncRootLayout(this);
+            requestAnimationFrame(() => syncRootLayout(this));
             return result;
         };
 
@@ -1176,9 +1243,10 @@ app.registerExtension({
             state.selectedTagWeights = parseSelectedTagWeights(state.selectedTagWeightsWidget?.value);
             state.tagOrder = parseTagOrder(state.tagOrderWidget?.value);
             state.selectionInitialized = normalizeBooleanValue(state.selectionInitializedWidget?.value, false);
-            reconcileStateFromPrompt(this);
             if (isPromptLinked(this)) {
                 refreshPromptPreview(this);
+            } else {
+                reconcileStateFromPrompt(this);
             }
             syncRootLayout(this);
             return result;
@@ -1253,6 +1321,8 @@ app.registerExtension({
         nodeType.prototype.onResize = function (size) {
             const result = onResize?.apply(this, [size]);
             if (this.__dtmState) {
+                size[0] = Math.max(400, size[0] || 0);
+                size[1] = Math.max(260, size[1] || 0);
                 syncRootLayout(this);
             }
             return result;

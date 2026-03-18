@@ -836,11 +836,40 @@ function injectStyle() {
     document.head.appendChild(style);
 }
 
-function hideWidget(widget) {
-    if (!widget) return;
-    widget.type = "hidden";
+function hideWidget(widget, suffix = "") {
+    if (!widget || widget.__dtsHidden) return;
+    widget.__dtsHidden = true;
+    widget.origType ??= widget.type;
+    widget.origComputeSize ??= widget.computeSize;
+    widget.type = `converted-widget${suffix}`;
+    widget.hidden = true;
+    widget.serialize = true;
     widget.computeSize = () => [0, -4];
     widget.draw = () => {};
+
+    const domWrapper = widget.inputEl?.closest?.(".dom-widget") ?? widget.inputEl ?? null;
+    if (domWrapper) {
+        domWrapper.hidden = true;
+        domWrapper.style.display = "none";
+        domWrapper.style.opacity = "0";
+        domWrapper.style.maxHeight = "0";
+        domWrapper.style.minHeight = "0";
+        domWrapper.style.height = "0";
+        domWrapper.style.pointerEvents = "none";
+    }
+
+    widget.linkedWidgets?.forEach(linkedWidget => {
+        hideWidget(linkedWidget, `:${widget.name || suffix}`);
+    });
+}
+
+function hideWidgetsByName(node, widgetNames) {
+    const names = new Set(widgetNames);
+    (node?.widgets || []).forEach(widget => {
+        if (names.has(widget?.name)) {
+            hideWidget(widget);
+        }
+    });
 }
 
 function compactTagsInputWidget(widget) {
@@ -1968,7 +1997,16 @@ function syncRootLayout(node) {
     const width = Math.max(300, Math.floor(node.size?.[0] || 640));
     const height = Math.max(240, Math.floor(node.size?.[1] || 620));
     const innerWidth = Math.max(280, width - 22);
-    const innerHeight = Math.max(180, height - 52);
+    const measuredTop = Number(state.domWidgetEl?.offsetTop || state.rootEl?.offsetTop || 0);
+    const widgetTop = Math.max(72, measuredTop);
+    const innerHeight = Math.max(180, height - widgetTop - 20);
+
+    if (state.domWidgetEl) {
+        state.domWidgetEl.style.height = `${innerHeight}px`;
+        state.domWidgetEl.style.maxHeight = `${innerHeight}px`;
+        state.domWidgetEl.style.overflow = "hidden";
+        state.domWidgetEl.style.boxSizing = "border-box";
+    }
 
     state.rootEl.style.width = `${innerWidth}px`;
     state.rootEl.style.maxWidth = `${innerWidth}px`;
@@ -3853,9 +3891,54 @@ app.registerExtension({
                 this.widgets.splice(insertAt, 0, domWidget);
             }
 
+            hideWidgetsByName(this, [
+                "selected_tags_json",
+                "selected_categories_json",
+                "manual_category_tags_json",
+                "selected_category_weights_json",
+                "selected_tag_weights_json",
+                "prefix_text",
+                "separator",
+                "use_all_when_empty",
+                "deduplicate_selected",
+                "keep_trailing_comma",
+                "excel_file",
+                "category_mapping",
+                "new_category_order",
+                "config_profile",
+                "default_category",
+                "regex_blacklist",
+                "tag_blacklist",
+                "deduplicate_tags",
+                "validation",
+                "force_reload",
+                "is_comment",
+            ]);
+
+            const minNodeWidth = 560;
+            const minNodeHeight = 360;
+            const defaultNodeWidth = 680;
+            const defaultNodeHeight = 620;
+            const currentWidth = Math.floor(this.size?.[0] || 0);
+            const currentHeight = Math.floor(this.size?.[1] || 0);
+            const looksLegacyTallLayout =
+                currentWidth > 0
+                && currentHeight > 0
+                && currentWidth <= 920
+                && currentHeight >= 900;
+            if (looksLegacyTallLayout) {
+                this.size = [Math.max(minNodeWidth, currentWidth), defaultNodeHeight];
+            } else if (currentWidth < minNodeWidth || currentHeight < minNodeHeight) {
+                this.size = [
+                    Math.max(minNodeWidth, currentWidth || defaultNodeWidth),
+                    Math.max(minNodeHeight, currentHeight || defaultNodeHeight),
+                ];
+            }
+
             this.__dtsState = {
                 isIntegrated: isIntegratedNode,
                 rootEl: root,
+                domWidgetEl: domWidget?.element || null,
                 leftPanel,
                 rightPanel,
                 viewSelect,
@@ -3988,6 +4071,7 @@ app.registerExtension({
 
             updateCategoryOrderFromSelection(this.__dtsState);
             syncRootLayout(this);
+            requestAnimationFrame(() => syncRootLayout(this));
             applyLanguage(this, false);
             renderAll(this);
             refreshCategories(this);
@@ -4112,6 +4196,8 @@ app.registerExtension({
         nodeType.prototype.onResize = function (size) {
             const result = onResize?.apply(this, [size]);
             if (this.__dtsState) {
+                size[0] = Math.max(560, size[0] || 0);
+                size[1] = Math.max(360, size[1] || 0);
                 syncRootLayout(this);
             }
             return result;
