@@ -5334,8 +5334,10 @@ app.registerExtension({
                    }
 
                    .ps-library-content {
-                       width: 800px;
-                       height: 600px;
+                       width: min(1520px, 96vw);
+                       height: min(920px, 92vh);
+                       min-width: min(1180px, 96vw);
+                       min-height: min(700px, 84vh);
                        background-color: #2a2a2a;
                        border: 1px solid #444;
                        border-radius: 12px;
@@ -6225,6 +6227,8 @@ app.registerExtension({
                        .ps-library-content {
                            width: 90vw;
                            height: 80vh;
+                           min-width: 0;
+                           min-height: 0;
                        }
                        
                        .ps-library-left-panel {
@@ -6240,6 +6244,8 @@ app.registerExtension({
                        .ps-library-content {
                            width: 95vw;
                            height: 90vh;
+                           min-width: 0;
+                           min-height: 0;
                        }
                        
                        .ps-library-body {

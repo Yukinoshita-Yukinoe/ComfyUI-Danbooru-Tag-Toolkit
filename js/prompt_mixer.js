@@ -525,6 +525,97 @@ function parseSelectedTagWeights(rawValue) {
     return result;
 }
 
+function hasSavedSelectionLikeState(state) {
+    if (!state) return false;
+    return (Array.isArray(state.selected) && state.selected.length > 0)
+        || (state.selectedSet instanceof Set && state.selectedSet.size > 0)
+        || (state.selectedTagWeights && Object.keys(state.selectedTagWeights).length > 0)
+        || (Array.isArray(state.tagOrder) && state.tagOrder.length > 0)
+        || Boolean(state.selectionInitialized);
+}
+
+function syncPromptSnapshotProperty(node, promptText = null) {
+    const candidate = String(promptText ?? node?.__dtmState?.latestPrompt ?? "");
+    if (!candidate.trim()) return;
+    node.properties = {
+        ...(node.properties || {}),
+        dtm_prompt_snapshot: candidate,
+    };
+}
+
+function syncStateProperties(node) {
+    const state = node?.__dtmState;
+    if (!state) return;
+
+    const selectedRaw = typeof state.selectedWidget?.value === "string"
+        ? state.selectedWidget.value
+        : JSON.stringify(Array.isArray(state.selected) ? state.selected : []);
+    const weightsRaw = typeof state.selectedTagWeightsWidget?.value === "string"
+        ? state.selectedTagWeightsWidget.value
+        : JSON.stringify(state.selectedTagWeights || {});
+    const orderRaw = typeof state.tagOrderWidget?.value === "string"
+        ? state.tagOrderWidget.value
+        : JSON.stringify(Array.isArray(state.tagOrder) ? state.tagOrder : []);
+    const initialized = Boolean(state.selectionInitialized);
+
+    const hasAnyState = parseSelected(selectedRaw).length > 0
+        || Object.keys(parseSelectedTagWeights(weightsRaw)).length > 0
+        || parseTagOrder(orderRaw).length > 0
+        || initialized;
+    if (!hasAnyState) return;
+
+    node.properties = {
+        ...(node.properties || {}),
+        dtm_selected_tags_json: selectedRaw,
+        dtm_selected_tag_weights_json: weightsRaw,
+        dtm_tag_order_json: orderRaw,
+        dtm_selection_initialized: initialized,
+        dtm_state_saved: true,
+    };
+
+    const promptCandidate = String(state.latestPrompt || state.promptSnapshot || "");
+    if (promptCandidate.trim()) {
+        node.properties.dtm_prompt_snapshot = promptCandidate;
+    }
+}
+
+function restoreStateFromProperties(node, widgets = {}) {
+    const properties = node?.properties || {};
+    const {
+        selectedWidget,
+        selectedTagWeightsWidget,
+        tagOrderWidget,
+        selectionInitializedWidget,
+    } = widgets;
+
+    if (typeof properties.dtm_selected_tags_json === "string" && selectedWidget) {
+        setWidgetValue(selectedWidget, properties.dtm_selected_tags_json);
+    }
+    if (typeof properties.dtm_selected_tag_weights_json === "string" && selectedTagWeightsWidget) {
+        setWidgetValue(selectedTagWeightsWidget, properties.dtm_selected_tag_weights_json);
+    }
+    if (typeof properties.dtm_tag_order_json === "string" && tagOrderWidget) {
+        setWidgetValue(tagOrderWidget, properties.dtm_tag_order_json);
+    }
+    if (selectionInitializedWidget && Object.prototype.hasOwnProperty.call(properties, "dtm_selection_initialized")) {
+        setWidgetValue(selectionInitializedWidget, Boolean(properties.dtm_selection_initialized));
+    }
+
+    return String(properties.dtm_prompt_snapshot || "");
+}
+
+function hasSavedSelectionState(node) {
+    const state = node?.__dtmState;
+    const properties = node?.properties || {};
+
+    if (typeof properties.dtm_selected_tags_json === "string" && parseSelected(properties.dtm_selected_tags_json).length > 0) return true;
+    if (typeof properties.dtm_selected_tag_weights_json === "string" && Object.keys(parseSelectedTagWeights(properties.dtm_selected_tag_weights_json)).length > 0) return true;
+    if (typeof properties.dtm_tag_order_json === "string" && parseTagOrder(properties.dtm_tag_order_json).length > 0) return true;
+    if (Object.prototype.hasOwnProperty.call(properties, "dtm_selection_initialized") && Boolean(properties.dtm_selection_initialized)) return true;
+
+    return hasSavedSelectionLikeState(state);
+}
+
 function splitTopLevelPromptParts(rawValue) {
     const text = String(rawValue || "");
     if (!text) return [];
@@ -707,7 +798,7 @@ function commitMixerDrag(node, targetKey = null, position = "after") {
 
     state.parsedItems = nextItems;
     state.tagOrder = nextItems.map(item => item.key);
-    syncStateWidgets(node, false);
+    syncStateWidgets(node);
     renderAll(node);
 }
 
@@ -778,6 +869,7 @@ function syncStateWidgets(node, markDirty = true) {
     setWidgetValue(state.selectedTagWeightsWidget, JSON.stringify(orderedWeights));
     setWidgetValue(state.tagOrderWidget, JSON.stringify(serializedOrder));
     setWidgetValue(state.selectionInitializedWidget, Boolean(state.selectionInitialized && orderedItems.length > 0));
+    syncStateProperties(node);
 
     if (markDirty) {
         node.setDirtyCanvas(true, true);
@@ -789,7 +881,7 @@ function getPromptSourceText(node) {
     const state = node.__dtmState;
     if (!state) return "";
     if (isPromptLinked(node)) {
-        return String(state.latestPrompt || "");
+        return String(state.latestPrompt || state.promptSnapshot || state.promptWidget?.value || "");
     }
     return String(state.promptWidget?.value || "");
 }
@@ -806,7 +898,19 @@ async function refreshPromptPreview(node) {
 
     const linkedText = getLinkedStringValue(node, "prompt");
     if (linkedText !== null) {
-        state.latestPrompt = String(linkedText || "");
+        const normalizedLinked = String(linkedText || "");
+        if (!normalizedLinked.trim()) {
+            const hasSnapshot = Boolean(String(state.promptSnapshot || "").trim());
+            if (hasSavedSelectionState(node) && hasSnapshot) {
+                reconcileStateFromPrompt(node);
+                return;
+            }
+            await loadLatestLinkedPrompt(node);
+            return;
+        }
+        state.latestPrompt = normalizedLinked;
+        state.promptSnapshot = state.latestPrompt;
+        syncPromptSnapshotProperty(node, state.promptSnapshot);
         reconcileStateFromPrompt(node);
         return;
     }
@@ -825,6 +929,10 @@ async function loadLatestLinkedPrompt(node) {
     try {
         const payload = await fetchJsonOrThrow(`/danbooru_prompt_mixer/latest?node_id=${encodeURIComponent(String(node.id))}`, { cache: "no-store" });
         state.latestPrompt = String(payload?.prompt || "");
+        if (state.latestPrompt.trim()) {
+            state.promptSnapshot = state.latestPrompt;
+            syncPromptSnapshotProperty(node, state.promptSnapshot);
+        }
     } catch (error) {
         console.error("[DanbooruPromptMixer] failed to load latest prompt:", error);
         state.latestPrompt = "";
@@ -838,13 +946,47 @@ function reconcileStateFromPrompt(node) {
 
     const previousKeys = new Set((state.parsedItems || []).map(item => item.key));
     const previousSelected = new Set((state.selected || []).map(normalizeTag));
-    const parsedItems = applyStoredTagOrder(parsePromptItems(getPromptSourceText(node)), state.tagOrder);
-    const itemLookup = new Map(parsedItems.map(item => [item.key, item]));
-
-    state.parsedItems = parsedItems;
-    state.tagOrder = parsedItems.map(item => item.key);
+    const persistedSelected = new Set(
+        parseSelected(node?.properties?.dtm_selected_tags_json).map(normalizeTag),
+    );
+    persistedSelected.forEach(key => previousSelected.add(key));
+    const hasPersistedState = hasSavedSelectionState(node);
+    let promptSourceText = getPromptSourceText(node);
+    let parsedBase = parsePromptItems(promptSourceText);
+    const snapshotText = String(state.promptSnapshot || "");
+    if (
+        !parsedBase.length
+        && snapshotText.trim()
+        && snapshotText.trim() !== String(promptSourceText || "").trim()
+    ) {
+        promptSourceText = snapshotText;
+        parsedBase = parsePromptItems(promptSourceText);
+    }
+    let parsedItems = applyStoredTagOrder(parsedBase, state.tagOrder);
+    if (isPromptLinked(node) && previousKeys.size === 0 && previousSelected.size > 0 && parsedItems.length > 0) {
+        const hasOverlapWithSelection = parsedItems.some(item => previousSelected.has(item.key));
+        if (!hasOverlapWithSelection) {
+            const snapshotItems = applyStoredTagOrder(parsePromptItems(state.promptSnapshot || ""), state.tagOrder);
+            const snapshotOverlap = snapshotItems.some(item => previousSelected.has(item.key));
+            if (snapshotItems.length > 0 && snapshotOverlap) {
+                promptSourceText = String(state.promptSnapshot || "");
+                parsedItems = snapshotItems;
+            } else {
+                renderAll(node);
+                return;
+            }
+        }
+    }
 
     if (!parsedItems.length) {
+        const shouldWaitForLinkedPrompt = isPromptLinked(node)
+            && !String(promptSourceText || "").trim()
+            && (hasPersistedState || previousKeys.size > 0 || previousSelected.size > 0);
+        if (shouldWaitForLinkedPrompt) {
+            renderAll(node);
+            return;
+        }
+
         state.selectionInitialized = false;
         state.selectedSet = new Set();
         state.selected = [];
@@ -856,16 +998,43 @@ function reconcileStateFromPrompt(node) {
         return;
     }
 
+    const itemLookup = new Map(parsedItems.map(item => [item.key, item]));
+    state.parsedItems = parsedItems;
+    state.tagOrder = parsedItems.map(item => item.key);
+    if (String(promptSourceText || "").trim()) {
+        state.promptSnapshot = String(promptSourceText || "");
+    }
+
     if (!state.selectionInitialized) {
-        state.selectedSet = new Set(parsedItems.map(item => item.key));
+        if (previousSelected.size > 0) {
+            const restoredSelected = new Set();
+            parsedItems.forEach(item => {
+                if (previousSelected.has(item.key)) {
+                    restoredSelected.add(item.key);
+                }
+            });
+            state.selectedSet = restoredSelected;
+        } else if (hasPersistedState) {
+            state.selectedSet = new Set();
+        } else {
+            state.selectedSet = new Set(parsedItems.map(item => item.key));
+        }
         state.selectionInitialized = true;
     } else {
         const nextSelected = new Set();
-        parsedItems.forEach(item => {
-            if (previousSelected.has(item.key) || !previousKeys.has(item.key)) {
-                nextSelected.add(item.key);
-            }
-        });
+        if (previousKeys.size === 0) {
+            parsedItems.forEach(item => {
+                if (previousSelected.has(item.key)) {
+                    nextSelected.add(item.key);
+                }
+            });
+        } else {
+            parsedItems.forEach(item => {
+                if (previousSelected.has(item.key) || !previousKeys.has(item.key)) {
+                    nextSelected.add(item.key);
+                }
+            });
+        }
         state.selectedSet = nextSelected;
     }
 
@@ -922,7 +1091,7 @@ function renderAll(node) {
         chip.onclick = () => {
             if (state.selectedSet.has(item.key)) state.selectedSet.delete(item.key);
             else state.selectedSet.add(item.key);
-            syncStateWidgets(node, false);
+            syncStateWidgets(node);
             renderAll(node);
         };
 
@@ -998,7 +1167,7 @@ function renderAll(node) {
             const nextWeight = normalizeWeightValue(currentWeight + 0.05, item.baseWeight);
             if (nextWeight === item.baseWeight) delete state.selectedTagWeights[item.tag];
             else state.selectedTagWeights[item.tag] = nextWeight;
-            syncStateWidgets(node, false);
+            syncStateWidgets(node);
             renderAll(node);
         };
 
@@ -1013,7 +1182,7 @@ function renderAll(node) {
             const nextWeight = normalizeWeightValue(currentWeight - 0.05, item.baseWeight);
             if (nextWeight === item.baseWeight) delete state.selectedTagWeights[item.tag];
             else state.selectedTagWeights[item.tag] = nextWeight;
-            syncStateWidgets(node, false);
+            syncStateWidgets(node);
             renderAll(node);
         };
 
@@ -1077,6 +1246,12 @@ app.registerExtension({
             const selectedTagWeightsWidget = getWidget(this, "selected_tag_weights_json");
             const tagOrderWidget = getWidget(this, "tag_order_json");
             const selectionInitializedWidget = getWidget(this, "selection_initialized");
+            const promptSnapshot = restoreStateFromProperties(this, {
+                selectedWidget,
+                selectedTagWeightsWidget,
+                tagOrderWidget,
+                selectionInitializedWidget,
+            });
 
             [selectedWidget, selectedTagWeightsWidget, tagOrderWidget, selectionInitializedWidget].forEach(hideWidget);
             hideWidget(promptWidget);
@@ -1181,6 +1356,7 @@ app.registerExtension({
                 tagOrder: parseTagOrder(tagOrderWidget?.value),
                 selectionInitialized: normalizeBooleanValue(selectionInitializedWidget?.value, false),
                 latestPrompt: "",
+                promptSnapshot: String(promptSnapshot || ""),
                 draggedKey: null,
                 draggedChipEl: null,
                 dragTargetKey: null,
@@ -1211,14 +1387,14 @@ app.registerExtension({
                 const state = this.__dtmState;
                 state.selectedSet = new Set((state.parsedItems || []).map(item => item.key));
                 state.selectionInitialized = (state.parsedItems || []).length > 0;
-                syncStateWidgets(this, false);
+                syncStateWidgets(this);
                 renderAll(this);
             };
             noneBtn.onclick = () => {
                 const state = this.__dtmState;
                 state.selectedSet = new Set();
                 state.selectionInitialized = (state.parsedItems || []).length > 0;
-                syncStateWidgets(this, false);
+                syncStateWidgets(this);
                 renderAll(this);
             };
 
@@ -1238,6 +1414,12 @@ app.registerExtension({
             const state = this.__dtmState;
             if (!state) return result;
 
+            state.promptSnapshot = restoreStateFromProperties(this, {
+                selectedWidget: state.selectedWidget,
+                selectedTagWeightsWidget: state.selectedTagWeightsWidget,
+                tagOrderWidget: state.tagOrderWidget,
+                selectionInitializedWidget: state.selectionInitializedWidget,
+            }) || state.promptSnapshot || "";
             state.selected = parseSelected(state.selectedWidget?.value);
             state.selectedSet = new Set(state.selected.map(normalizeTag));
             state.selectedTagWeights = parseSelectedTagWeights(state.selectedTagWeightsWidget?.value);

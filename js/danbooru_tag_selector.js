@@ -4,6 +4,7 @@ import { api } from "/scripts/api.js";
 
 const EXT_NAME = "Comfy.DanbooruTagToolkit";
 const STYLE_ID = "danbooru-tag-selector-style";
+const MAX_UI_NODE_HEIGHT = 2000;
 const DANBOORU_AUTOCOMPLETE_CACHE = new Map();
 const DANBOORU_AUTOCOMPLETE_CACHE_TTL_MS = 60 * 1000;
 const I18N = {
@@ -218,9 +219,11 @@ function injectStyle() {
             position: relative;
             font-size: 12px;
             overflow: hidden;
+            min-width: 0;
             height: var(--dts-root-h, auto);
             display: flex;
             flex-direction: column;
+            max-width: 100%;
         }
         .dts-head {
             display: grid;
@@ -228,6 +231,7 @@ function injectStyle() {
             gap: 8px;
             align-items: center;
             margin-bottom: 8px;
+            min-width: 0;
         }
         .dts-title {
             font-weight: 700;
@@ -245,6 +249,9 @@ function injectStyle() {
             display: flex;
             gap: 6px;
             align-items: center;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+            min-width: 0;
         }
         .dts-view-select {
             display: none;
@@ -279,10 +286,16 @@ function injectStyle() {
         }
         .dts-main {
             display: grid;
-            grid-template-columns: 1.3fr 1fr;
+            grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr);
+            grid-template-rows: minmax(0, 1fr);
             gap: 10px;
             min-height: 0;
+            min-width: 0;
+            overflow: hidden;
             flex: 1 1 auto;
+            width: 100%;
+            max-width: 100%;
+            height: 100%;
         }
         .dts-panel {
             border: 1px solid var(--dts-border);
@@ -294,6 +307,30 @@ function injectStyle() {
             display: flex;
             flex-direction: column;
             min-width: 0;
+            height: 100%;
+            overflow: hidden;
+            width: 100%;
+            max-width: 100%;
+        }
+        .dts-panel-left {
+            display: grid;
+            grid-template-rows: auto auto auto minmax(0, 1fr);
+        }
+        .dts-panel-right {
+            display: flex;
+            flex-direction: column;
+        }
+        .dts-panel-scroll {
+            flex: 1 1 0;
+            min-height: 0;
+            min-width: 0;
+            overflow-y: auto;
+            overflow-x: hidden;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            padding-right: 2px;
+            scrollbar-gutter: stable;
         }
         .dts-panel-head {
             display: flex;
@@ -301,20 +338,25 @@ function injectStyle() {
             align-items: center;
             gap: 8px;
             margin-bottom: 8px;
+            min-width: 0;
+            flex: 0 0 auto;
         }
         .dts-panel-title {
             font-weight: 700;
             color: #f4f8ff;
+            min-width: 0;
         }
         .dts-panel-hint {
             font-size: 11px;
             color: var(--dts-soft);
+            min-width: 0;
         }
         .dts-tools {
             display: grid;
-            grid-template-columns: 1fr auto;
+            grid-template-columns: minmax(0, 1fr) auto;
             gap: 6px;
             margin-bottom: 8px;
+            min-width: 0;
         }
         .dts-search-wrap {
             position: relative;
@@ -367,8 +409,12 @@ function injectStyle() {
             flex-direction: column;
             gap: 8px;
             padding-right: 2px;
-            flex: 1 1 auto;
-            min-height: 120px;
+            flex: 1 1 0;
+            min-height: 0;
+            min-width: 0;
+            width: 100%;
+            max-width: 100%;
+            scrollbar-gutter: stable;
         }
         .dts-category {
             border: 1px solid #304661;
@@ -421,6 +467,8 @@ function injectStyle() {
             display: inline-flex;
             align-items: center;
             gap: 6px;
+            min-width: 0;
+            max-width: 100%;
         }
         .dts-tag:hover {
             border-color: #6a8fbd;
@@ -436,6 +484,8 @@ function injectStyle() {
         }
         .dts-tag-label {
             min-width: 0;
+            word-break: break-word;
+            overflow-wrap: anywhere;
         }
         .dts-tag-badge {
             border-radius: 999px;
@@ -491,9 +541,13 @@ function injectStyle() {
             flex-direction: column;
             gap: 6px;
             max-height: none;
-            overflow: auto;
-            flex: 1 1 auto;
-            min-height: 90px;
+            overflow: visible;
+            flex: 0 0 auto;
+            height: auto;
+            min-height: 0;
+            min-width: 0;
+            width: 100%;
+            max-width: 100%;
         }
         .dts-selected-cat-item {
             border: 1px solid #405a80;
@@ -501,9 +555,11 @@ function injectStyle() {
             background: #142741;
             padding: 6px;
             display: grid;
-            grid-template-columns: 28px 1fr auto;
+            grid-template-columns: 28px minmax(0, 1fr) auto;
             gap: 6px;
             align-items: start;
+            min-width: 0;
+            max-width: 100%;
         }
         .dts-selected-cat-item.dragging {
             opacity: .46;
@@ -537,12 +593,15 @@ function injectStyle() {
             font-weight: 700;
             margin-bottom: 3px;
             font-size: 12px;
+            word-break: break-word;
+            overflow-wrap: anywhere;
         }
         .dts-selected-line {
             color: #d6e6ff;
             line-height: 1.38;
             font-size: 11px;
             word-break: break-word;
+            overflow-wrap: anywhere;
         }
         .dts-selected-add {
             display: grid;
@@ -608,6 +667,10 @@ function injectStyle() {
             display: flex;
             gap: 4px;
             align-items: center;
+            justify-content: flex-end;
+            flex: 0 0 auto;
+            flex-wrap: wrap;
+            min-width: 0;
         }
         .dts-weight-input {
             width: 52px;
@@ -655,7 +718,6 @@ function injectStyle() {
             background: #4f2b3c;
         }
         .dts-preview {
-            margin-top: 8px;
             border: 1px solid #334964;
             border-radius: 8px;
             background: #0f1828;
@@ -666,11 +728,17 @@ function injectStyle() {
             word-break: break-word;
             line-height: 1.4;
             flex-shrink: 0;
+            overflow: visible;
+            width: 100%;
+            max-width: 100%;
+            box-sizing: border-box;
         }
         .dts-meta {
-            margin-top: 6px;
             color: var(--dts-soft);
             font-size: 11px;
+            flex: 0 0 auto;
+            min-width: 0;
+            overflow-wrap: anywhere;
         }
         .dts-empty {
             color: #95a9c7;
@@ -806,7 +874,7 @@ function injectStyle() {
             accent-color: var(--dts-accent);
         }
         .dts-root.dts-compact .dts-main {
-            grid-template-columns: 1fr;
+            grid-template-columns: minmax(0, 1fr);
             grid-template-rows: minmax(170px, 1fr) minmax(140px, 1fr);
         }
         .dts-root.dts-compact .dts-panel-hint {
@@ -824,7 +892,7 @@ function injectStyle() {
         }
         @media (max-width: 760px) {
             .dts-main {
-                grid-template-columns: 1fr;
+                grid-template-columns: minmax(0, 1fr);
             }
             .dts-settings {
                 left: 10px;
@@ -879,6 +947,13 @@ function compactTagsInputWidget(widget) {
         const original = originalComputeSize ? originalComputeSize(width) : [Math.max(220, width || 220), 70];
         return [original[0], 44];
     };
+}
+
+function stabilizeDomWidgetComputeSize(widget) {
+    if (!widget || widget.__dtsDomSizeStable) return;
+    widget.__dtsDomSizeStable = true;
+    widget.origComputeSize ??= widget.computeSize;
+    widget.computeSize = width => [Math.max(0, Math.floor(width || 0)), 0];
 }
 
 function getWidget(node, name) {
@@ -1972,22 +2047,63 @@ function scheduleRefresh(node, delay = 420) {
 
 function applyPanelVisibility(state) {
     if (!state?.leftPanel || !state?.rightPanel) return;
+    const showPanel = panel => {
+        panel.style.display = "";
+    };
     if (!state.compact) {
-        state.leftPanel.style.display = "flex";
-        state.rightPanel.style.display = "flex";
+        showPanel(state.leftPanel);
+        showPanel(state.rightPanel);
         return;
     }
     const mode = state.viewMode || "split";
     if (mode === "selected") {
         state.leftPanel.style.display = "none";
-        state.rightPanel.style.display = "flex";
+        showPanel(state.rightPanel);
     } else if (mode === "categories") {
-        state.leftPanel.style.display = "flex";
+        showPanel(state.leftPanel);
         state.rightPanel.style.display = "none";
     } else {
-        state.leftPanel.style.display = "flex";
-        state.rightPanel.style.display = "flex";
+        showPanel(state.leftPanel);
+        showPanel(state.rightPanel);
     }
+}
+
+function getWidgetHeight(widget, width = 320) {
+    if (!widget || widget.hidden) return 0;
+    if (typeof widget.type === "string" && widget.type.startsWith("converted-widget")) return 0;
+    try {
+        const size = typeof widget.computeSize === "function" ? widget.computeSize(width) : null;
+        const height = Number(Array.isArray(size) ? size[1] : 0);
+        return Number.isFinite(height) && height > 0 ? height : 0;
+    } catch {
+        return 0;
+    }
+}
+
+function getStableWidgetTop(node, width) {
+    const state = node?.__dtsState;
+    const baseTop = 72;
+    if (!state) return baseTop;
+
+    let expectedTop = baseTop;
+    if (state.isIntegrated) {
+        const tagsHeight = getWidgetHeight(state.tagsWidget, width);
+        if (tagsHeight > 0) {
+            expectedTop += tagsHeight + 10;
+        }
+    }
+
+    const measuredTop = Number(state.domWidgetEl?.offsetTop || state.rootEl?.offsetTop || 0);
+    if (!Number.isFinite(measuredTop) || measuredTop <= 0) {
+        state.lastStableWidgetTop = expectedTop;
+        return expectedTop;
+    }
+
+    const lowerBound = Math.max(baseTop, expectedTop - 8);
+    const upperBound = expectedTop + 20;
+    const clampedTop = Math.min(upperBound, Math.max(lowerBound, Math.floor(measuredTop)));
+    state.lastStableWidgetTop = clampedTop;
+    return clampedTop;
 }
 
 function syncRootLayout(node) {
@@ -1995,21 +2111,35 @@ function syncRootLayout(node) {
     if (!state?.rootEl) return;
 
     const width = Math.max(300, Math.floor(node.size?.[0] || 640));
-    const height = Math.max(240, Math.floor(node.size?.[1] || 620));
+    const height = Math.min(MAX_UI_NODE_HEIGHT, Math.max(240, Math.floor(node.size?.[1] || 620)));
+    if (Array.isArray(node.size) && node.size[1] !== height) {
+        node.size[1] = height;
+    }
     const innerWidth = Math.max(280, width - 22);
-    const measuredTop = Number(state.domWidgetEl?.offsetTop || state.rootEl?.offsetTop || 0);
-    const widgetTop = Math.max(72, measuredTop);
-    const innerHeight = Math.max(180, height - widgetTop - 20);
+    if (!state.domWidgetEl || !state.domWidgetEl.isConnected) {
+        state.domWidgetEl = state.rootEl?.closest?.(".dom-widget") ?? state.rootEl?.parentElement ?? null;
+    }
+    const widgetTop = getStableWidgetTop(node, innerWidth);
+    const bottomPadding = 12;
+    const innerHeight = Math.max(120, Math.floor(height - widgetTop - bottomPadding));
 
     if (state.domWidgetEl) {
+        state.domWidgetEl.style.width = `${innerWidth}px`;
+        state.domWidgetEl.style.maxWidth = `${innerWidth}px`;
         state.domWidgetEl.style.height = `${innerHeight}px`;
         state.domWidgetEl.style.maxHeight = `${innerHeight}px`;
+        state.domWidgetEl.style.minHeight = `${innerHeight}px`;
         state.domWidgetEl.style.overflow = "hidden";
         state.domWidgetEl.style.boxSizing = "border-box";
+        state.domWidgetEl.style.minWidth = "0";
     }
 
-    state.rootEl.style.width = `${innerWidth}px`;
-    state.rootEl.style.maxWidth = `${innerWidth}px`;
+    state.rootEl.style.width = "100%";
+    state.rootEl.style.maxWidth = "100%";
+    state.rootEl.style.minWidth = "0";
+    state.rootEl.style.height = `${innerHeight}px`;
+    state.rootEl.style.maxHeight = `${innerHeight}px`;
+    state.rootEl.style.minHeight = `${innerHeight}px`;
     state.rootEl.style.setProperty("--dts-root-h", `${innerHeight}px`);
 
     state.compact = width < 650 || height < 500;
@@ -2023,6 +2153,36 @@ function syncRootLayout(node) {
         if (state.viewSelect) state.viewSelect.value = "split";
     }
     applyPanelVisibility(state);
+}
+
+function scheduleRootLayoutSync(node, delay = 120) {
+    const state = node?.__dtsState;
+    if (!state?.rootEl) return;
+
+    syncRootLayout(node);
+    if (state.layoutRafId) {
+        cancelAnimationFrame(state.layoutRafId);
+        state.layoutRafId = null;
+    }
+    if (state.layoutTimeoutId) {
+        clearTimeout(state.layoutTimeoutId);
+        state.layoutTimeoutId = null;
+    }
+
+    state.layoutRafId = requestAnimationFrame(() => {
+        syncRootLayout(node);
+        state.layoutRafId = requestAnimationFrame(() => {
+            syncRootLayout(node);
+            state.layoutRafId = null;
+            node.setDirtyCanvas?.(true, true);
+        });
+    });
+
+    state.layoutTimeoutId = setTimeout(() => {
+        syncRootLayout(node);
+        state.layoutTimeoutId = null;
+        node.setDirtyCanvas?.(true, true);
+    }, Math.max(0, delay));
 }
 
 function getFilteredCategories(state) {
@@ -3796,7 +3956,7 @@ app.registerExtension({
             main.className = "dts-main";
 
             const leftPanel = document.createElement("div");
-            leftPanel.className = "dts-panel";
+            leftPanel.className = "dts-panel dts-panel-left";
             const leftHead = document.createElement("div");
             leftHead.className = "dts-panel-head";
             const leftTitle = document.createElement("div");
@@ -3847,7 +4007,7 @@ app.registerExtension({
             leftPanel.appendChild(categoriesEl);
 
             const rightPanel = document.createElement("div");
-            rightPanel.className = "dts-panel";
+            rightPanel.className = "dts-panel dts-panel-right";
             const rightHead = document.createElement("div");
             rightHead.className = "dts-panel-head";
             const rightTitle = document.createElement("div");
@@ -3865,16 +4025,20 @@ app.registerExtension({
             previewEl.className = "dts-preview";
             const metaEl = document.createElement("div");
             metaEl.className = "dts-meta";
+            const rightScrollEl = document.createElement("div");
+            rightScrollEl.className = "dts-panel-scroll";
+            rightScrollEl.appendChild(selectedEl);
+            rightScrollEl.appendChild(previewEl);
+            rightScrollEl.appendChild(metaEl);
 
             rightPanel.appendChild(rightHead);
-            rightPanel.appendChild(selectedEl);
-            rightPanel.appendChild(previewEl);
-            rightPanel.appendChild(metaEl);
+            rightPanel.appendChild(rightScrollEl);
 
             main.appendChild(leftPanel);
             main.appendChild(rightPanel);
             root.appendChild(main);
             const domWidget = this.addDOMWidget("danbooru_tag_selector_ui", "div", root, { serialize: false });
+            stabilizeDomWidgetComputeSize(domWidget);
             // 把 DOM 区域放在靠前位置，避免被隐藏 widget 挤出大量顶部空白
             if (Array.isArray(this.widgets)) {
                 const domIndex = this.widgets.indexOf(domWidget);
@@ -3938,9 +4102,10 @@ app.registerExtension({
             this.__dtsState = {
                 isIntegrated: isIntegratedNode,
                 rootEl: root,
-                domWidgetEl: domWidget?.element || null,
+                domWidgetEl: domWidget?.element || domWidget?.inputEl || null,
                 leftPanel,
                 rightPanel,
+                rightScrollEl,
                 viewSelect,
                 viewMode: "split",
                 compact: false,
@@ -4070,8 +4235,7 @@ app.registerExtension({
             noneVisibleBtn.onclick = () => clearVisibleTags(this);
 
             updateCategoryOrderFromSelection(this.__dtsState);
-            syncRootLayout(this);
-            requestAnimationFrame(() => syncRootLayout(this));
+            scheduleRootLayoutSync(this);
             applyLanguage(this, false);
             renderAll(this);
             refreshCategories(this);
@@ -4082,7 +4246,7 @@ app.registerExtension({
         nodeType.prototype.onExecuted = function () {
             const result = onExecuted?.apply(this, arguments);
             if (this.__dtsState) {
-                syncRootLayout(this);
+                scheduleRootLayoutSync(this, 60);
                 refreshCategories(this);
             }
             return result;
@@ -4103,7 +4267,7 @@ app.registerExtension({
             applyManualTagsToCategories(state);
             syncSettingsFromWidgets(this);
             updateCategoryOrderFromSelection(state);
-            syncRootLayout(this);
+            scheduleRootLayoutSync(this, 180);
             applyLanguage(this, false);
             renderAll(this);
             return result;
@@ -4197,7 +4361,7 @@ app.registerExtension({
             const result = onResize?.apply(this, [size]);
             if (this.__dtsState) {
                 size[0] = Math.max(560, size[0] || 0);
-                size[1] = Math.max(360, size[1] || 0);
+                size[1] = Math.min(MAX_UI_NODE_HEIGHT, Math.max(360, size[1] || 0));
                 syncRootLayout(this);
             }
             return result;

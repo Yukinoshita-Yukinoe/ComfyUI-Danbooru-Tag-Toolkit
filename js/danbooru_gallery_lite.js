@@ -3,6 +3,10 @@ import { api } from "/scripts/api.js";
 
 const EXT_NAME = "Comfy.DanbooruTagGalleryLite";
 const STYLE_ID = "dtg-lite-style";
+const MAX_UI_NODE_HEIGHT = 2000;
+const ROOT_TOP_BASE = 72;
+const ROOT_TOP_TOLERANCE = 20;
+const ROOT_BOTTOM_PADDING = 12;
 const CATEGORY_KEYS = ["artist", "copyright", "character", "general", "meta"];
 const DEFAULT_PROMPT_CATEGORIES = ["artist", "copyright", "character", "general"];
 const LEGACY_PROMPT_CATEGORIES = ["copyright", "character", "general"];
@@ -37,8 +41,11 @@ function injectStyle() {
             gap: 10px;
             padding: 10px;
             box-sizing: border-box;
-            height: 100%;
-            min-height: 360px;
+            width: 100%;
+            max-width: 100%;
+            min-width: 0;
+            height: var(--dtg-root-h, auto);
+            min-height: 0;
             overflow: hidden;
             background: #171717;
             border: 1px solid #303030;
@@ -403,6 +410,23 @@ function injectStyle() {
 
 function getWidget(node, name) {
     return node?.widgets?.find(w => w?.name === name);
+}
+
+function getStableWidgetTop(measuredTop) {
+    if (!Number.isFinite(measuredTop) || measuredTop <= 0) {
+        return ROOT_TOP_BASE;
+    }
+    return Math.min(
+        ROOT_TOP_BASE + ROOT_TOP_TOLERANCE,
+        Math.max(ROOT_TOP_BASE, Math.floor(measuredTop))
+    );
+}
+
+function stabilizeDomWidgetComputeSize(widget) {
+    if (!widget || widget.__dtgDomSizeStable) return;
+    widget.__dtgDomSizeStable = true;
+    widget.origComputeSize ??= widget.computeSize;
+    widget.computeSize = width => [Math.max(0, Math.floor(width || 0)), 0];
 }
 
 function hideWidget(widget, suffix = "") {
@@ -894,6 +918,7 @@ app.registerExtension({
             root.appendChild(bottom);
 
             const uiWidget = this.addDOMWidget("danbooru_gallery_lite_ui", "div", root, { serialize: false });
+            stabilizeDomWidgetComputeSize(uiWidget);
 
             const state = {
                 node: this,
@@ -929,8 +954,41 @@ app.registerExtension({
 
             const originalOnResize = this.onResize;
             const syncGridLayout = (size = this.size) => {
-                const nodeHeight = Math.max(360, Number(Array.isArray(size) ? size[1] : this.size?.[1]) || 760);
+                const nodeHeight = Math.min(MAX_UI_NODE_HEIGHT, Math.max(360, Number(Array.isArray(size) ? size[1] : this.size?.[1]) || 760));
                 const nodeWidth = Math.max(360, Number(Array.isArray(size) ? size[0] : this.size?.[0]) || 720);
+                if (Array.isArray(this.size) && this.size[1] !== nodeHeight) {
+                    this.size[1] = nodeHeight;
+                }
+                const domWidgetEl =
+                    uiWidget?.element
+                    || uiWidget?.inputEl
+                    || root.closest?.(".dom-widget")
+                    || root.parentElement
+                    || null;
+                const innerWidth = Math.max(320, Math.floor(nodeWidth - 22));
+                const measuredTop = Number(domWidgetEl?.offsetTop || root.offsetTop || 0);
+                const widgetTop = getStableWidgetTop(measuredTop);
+                const innerHeight = Math.max(260, Math.floor(nodeHeight - widgetTop - ROOT_BOTTOM_PADDING));
+
+                if (domWidgetEl) {
+                    domWidgetEl.style.width = `${innerWidth}px`;
+                    domWidgetEl.style.maxWidth = `${innerWidth}px`;
+                    domWidgetEl.style.height = `${innerHeight}px`;
+                    domWidgetEl.style.maxHeight = `${innerHeight}px`;
+                    domWidgetEl.style.minHeight = `${innerHeight}px`;
+                    domWidgetEl.style.overflow = "hidden";
+                    domWidgetEl.style.boxSizing = "border-box";
+                    domWidgetEl.style.minWidth = "0";
+                }
+
+                root.style.width = "100%";
+                root.style.maxWidth = "100%";
+                root.style.minWidth = "0";
+                root.style.height = `${innerHeight}px`;
+                root.style.maxHeight = `${innerHeight}px`;
+                root.style.minHeight = `${innerHeight}px`;
+                root.style.setProperty("--dtg-root-h", `${innerHeight}px`);
+
                 const rootStyle = window.getComputedStyle(root);
                 const paddingTop = parseFloat(rootStyle.paddingTop || "0");
                 const paddingBottom = parseFloat(rootStyle.paddingBottom || "0");
@@ -943,28 +1001,57 @@ app.registerExtension({
                     (statusEl.offsetHeight || 0) +
                     (bottom.offsetHeight || 0) +
                     (gap * 4) +
-                    56;
-                const contentHeight = Math.max(180, Math.floor(nodeHeight - nonGridHeight));
+                    2;
+                const contentHeight = Math.max(180, Math.floor(innerHeight - nonGridHeight));
                 content.style.height = `${contentHeight}px`;
-                if (uiWidget?.element) {
-                    uiWidget.element.style.height = `${Math.max(320, nodeHeight - 46)}px`;
-                }
+                content.style.maxHeight = `${contentHeight}px`;
+                content.style.minHeight = `${contentHeight}px`;
 
                 const narrow = nodeWidth <= 980;
                 const sidebarWidth = narrow ? 0 : 230;
                 const contentGap = 10;
-                const gridWidth = Math.max(180, nodeWidth - 30 - sidebarWidth - (narrow ? 0 : contentGap));
+                const gridWidth = Math.max(180, innerWidth - 20 - sidebarWidth - (narrow ? 0 : contentGap));
                 const minCardWidth = 260;
                 const maxColumns = narrow ? 2 : 3;
                 const columns = Math.max(1, Math.min(maxColumns, Math.floor(gridWidth / minCardWidth) || 1));
                 grid.style.gridTemplateColumns = `repeat(${columns}, minmax(0, 1fr))`;
                 requestAnimationFrame(() => resizeAllMasonryCards());
             };
+            const scheduleGridLayoutSync = (delay = 120) => {
+                syncGridLayout(this.size);
+                if (state.layoutRafId) {
+                    cancelAnimationFrame(state.layoutRafId);
+                    state.layoutRafId = null;
+                }
+                if (state.layoutTimeoutId) {
+                    clearTimeout(state.layoutTimeoutId);
+                    state.layoutTimeoutId = null;
+                }
+
+                state.layoutRafId = requestAnimationFrame(() => {
+                    syncGridLayout(this.size);
+                    state.layoutRafId = requestAnimationFrame(() => {
+                        syncGridLayout(this.size);
+                        state.layoutRafId = null;
+                        this.setDirtyCanvas?.(true, true);
+                    });
+                });
+
+                state.layoutTimeoutId = setTimeout(() => {
+                    syncGridLayout(this.size);
+                    state.layoutTimeoutId = null;
+                    this.setDirtyCanvas?.(true, true);
+                }, Math.max(0, delay));
+            };
             this.onResize = size => {
                 originalOnResize?.call(this, size);
+                if (Array.isArray(size)) {
+                    size[1] = Math.min(MAX_UI_NODE_HEIGHT, Math.max(360, Number(size[1] || 0)));
+                }
                 syncGridLayout(size);
             };
             state.syncGridLayout = syncGridLayout;
+            state.scheduleGridLayoutSync = scheduleGridLayoutSync;
 
             function updateSummary() {
                 state.summaryEl.textContent = `Page: ${state.page} | Posts: ${state.posts.length} | Selected: ${state.selectedMap.size}`;
@@ -1499,7 +1586,7 @@ app.registerExtension({
             });
 
             renderPosts();
-            requestAnimationFrame(() => syncGridLayout(this.size));
+            scheduleGridLayoutSync();
             if (!state.posts.length) {
                 syncStateWidget(false);
             }
@@ -1509,6 +1596,14 @@ app.registerExtension({
         const onRemoved = nodeType.prototype.onRemoved;
         nodeType.prototype.onRemoved = function () {
             const state = this.__dtgState;
+            if (state?.layoutRafId) {
+                cancelAnimationFrame(state.layoutRafId);
+                state.layoutRafId = null;
+            }
+            if (state?.layoutTimeoutId) {
+                clearTimeout(state.layoutTimeoutId);
+                state.layoutTimeoutId = null;
+            }
             if (state?.tooltipEl) {
                 state.tooltipEl.remove();
                 state.tooltipEl = null;
@@ -1560,7 +1655,7 @@ app.registerExtension({
             state.posts = Array.from(dedup.values());
             state.updateSelectedPromptsByCategory?.();
             state.renderPosts?.();
-            state.syncGridLayout?.(this.size);
+            state.scheduleGridLayoutSync?.(180);
             syncSelectionWidget(state.node, state.selectionWidget, state.selectedMap);
             return result;
         };
