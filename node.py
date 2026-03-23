@@ -4,6 +4,7 @@ import os
 import ast
 import hashlib
 import json
+import pickle
 import re
 import io
 import time
@@ -13,7 +14,7 @@ import torch
 import comfy
 import numpy as np
 from PIL import Image
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Iterable
 
 try:
     from server import PromptServer
@@ -23,7 +24,7 @@ except Exception:
     web = None
 
 _tag_cache = {}
-_latest_tag_bundle_by_node: Dict[str, Dict[str, List[str]]] = {}
+_latest_tag_bundle_by_node: Dict[str, Dict[str, Any]] = {}
 _gallery_post_cache: Dict[str, Dict[str, Any]] = {}
 _gallery_image_cache: Dict[str, Dict[str, Any]] = {}
 _gallery_autocomplete_cache: Dict[str, Dict[str, Any]] = {}
@@ -39,6 +40,62 @@ _GALLERY_AUTOCOMPLETE_CACHE_TTL = 300
 _GALLERY_AUTOCOMPLETE_CACHE_LIMIT = 256
 SEPARATOR_OPTIONS = ["comma", "newline", "space", True, False, "True", "False", "true", "false"]
 _SORTER_PRESET_DIR_NAME = "sorter_presets"
+_TAG_DATABASE_CACHE_DIR_NAME = ".tag_db_cache"
+_TAG_DATABASE_CACHE_VERSION = 1
+_TAG_DATABASE_REQUIRED_COLUMNS = (
+    "english",
+    "category",
+    "subcategory",
+    "category_key",
+    "subcategory_key",
+    "category_zh",
+    "category_en",
+    "subcategory_zh",
+    "subcategory_en",
+)
+_OUTPUT_CATEGORY_DEFINITIONS = (
+    {"key": "artist_terms", "zh": "画师词", "en": "Artist"},
+    {"key": "background_terms", "zh": "背景词", "en": "Background"},
+    {"key": "subject_terms", "zh": "人物对象词", "en": "Subject"},
+    {"key": "character_feature_terms", "zh": "角色特征词", "en": "Character Features"},
+    {"key": "facial_feature_terms", "zh": "角色五官词", "en": "Facial Features"},
+    {"key": "body_part_terms", "zh": "角色部位词", "en": "Body Parts"},
+    {"key": "sexual_feature_terms", "zh": "性征部位词", "en": "Sexual Features"},
+    {"key": "outfit_terms", "zh": "服饰词", "en": "Outfit"},
+    {"key": "action_terms", "zh": "动作词", "en": "Actions"},
+    {"key": "expression_terms", "zh": "角色表情词", "en": "Expressions"},
+    {"key": "camera_terms", "zh": "镜头词", "en": "Camera"},
+    {"key": "uncategorized_terms", "zh": "未归类词", "en": "Uncategorized"},
+)
+_OUTPUT_CATEGORY_LEGACY_EN_ALIASES_BY_KEY = {
+    "artist_terms": ("Artist Terms",),
+    "background_terms": ("Background Terms",),
+    "subject_terms": ("Subject Terms",),
+    "character_feature_terms": ("Character Feature Terms",),
+    "facial_feature_terms": ("Facial Feature Terms",),
+    "body_part_terms": ("Body Part Terms",),
+    "sexual_feature_terms": ("Sexual Feature Terms",),
+    "outfit_terms": ("Outfit Terms",),
+    "action_terms": ("Action Terms",),
+    "expression_terms": ("Expression Terms",),
+    "camera_terms": ("Camera Terms",),
+    "uncategorized_terms": ("Uncategorized Terms",),
+}
+_OUTPUT_CATEGORY_LABELS_BY_KEY = {
+    str(entry["key"]): {
+        "zh": str(entry["zh"]),
+        "en": str(entry["en"]),
+    }
+    for entry in _OUTPUT_CATEGORY_DEFINITIONS
+}
+_OUTPUT_CATEGORY_ALIAS_TO_KEY = {}
+for _entry in _OUTPUT_CATEGORY_DEFINITIONS:
+    _key = str(_entry["key"]).strip()
+    _legacy_aliases = _OUTPUT_CATEGORY_LEGACY_EN_ALIASES_BY_KEY.get(_key, ())
+    for _alias in {_entry["key"], _entry["zh"], _entry["en"], *_legacy_aliases}:
+        _alias_text = str(_alias or "").strip().lower()
+        if _alias_text and _alias_text not in _OUTPUT_CATEGORY_ALIAS_TO_KEY:
+            _OUTPUT_CATEGORY_ALIAS_TO_KEY[_alias_text] = _key
 
 
 def load_defaults_from_json():
@@ -49,7 +106,7 @@ def load_defaults_from_json():
     fallback_order = "[]"
 
     if not os.path.exists(config_path):
-        print(f"[DanbooruTagToolkit] Warning喵：未找到配置文件{config_path}喵，将使用空默认值喵。")
+        print(f"[DanbooruTagToolkit] Warning: defaults config not found, using empty defaults: {config_path}")
         return fallback_mapping, fallback_order
 
     try:
@@ -72,11 +129,10 @@ def load_defaults_from_json():
         # 搞半天要自己拼.jpg
         default_mapping_text = "{\n" + ",\n".join(mapping_lines) + "\n}"
 
-        print(f"Sorter成功加载配置文件喵: {config_path}")
         return default_mapping_text, default_order_text
 
     except Exception as e:
-        print(f"Sorter读取配置文件失败喵，请检查defaults_config.json路径及语法是否正确喵: {e}")
+        print(f"[DanbooruTagToolkit] Failed to read defaults config: {e}")
         return fallback_mapping, fallback_order
 
 
@@ -86,22 +142,151 @@ DEFAULT_MAPPING_TEXT, DEFAULT_ORDER_TEXT = load_defaults_from_json()
 CATEGORY_MAPPING_PLACEHOLDER = (
     "示例1（精确元组）:\n"
     '{("人物","对象"): "人物对象词"}\n\n'
+    "示例1b（英文短名称也可）:\n"
+    '{("人物","对象"): "Subject"}\n\n'
     "示例2（仅大类）:\n"
     '{"人物": "人物对象词"}\n\n'
     "示例3（大类通配）:\n"
     '{("服饰","*"): "服饰词"}\n\n'
+    "目标分类可填：中文 / 英文短名称 / 内部key；\n"
+    "例如：人物对象词 / Subject / subject_terms\n"
     "可混合使用，优先级: (大类,子类) > 大类 > (大类,*)"
 )
 
 CATEGORY_ORDER_PLACEHOLDER = (
     "支持三种写法:\n"
     '1) JSON: ["背景词","人物对象词","未归类词"]\n'
+    '1b) JSON(英文): ["Background","Subject","Uncategorized"]\n'
     "2) Python: ['背景词','人物对象词','未归类词']\n"
     "3) 每行一个分类:\n"
     "背景词\n"
     "人物对象词\n"
-    "未归类词"
+    "未归类词\n\n"
+    "同样支持：中文 / 英文短名称 / 内部key"
 )
+
+
+def _normalize_lookup_text(raw_value: Any) -> str:
+    return str(raw_value or "").strip().lower()
+
+
+def _resolve_output_category_key(raw_value: Any) -> str:
+    text = str(raw_value or "").strip()
+    if not text:
+        return ""
+    normalized = _normalize_lookup_text(text)
+    return _OUTPUT_CATEGORY_ALIAS_TO_KEY.get(normalized, text)
+
+
+def _build_output_category_labels(raw_values: Iterable[Any]) -> Dict[str, Dict[str, str]]:
+    labels: Dict[str, Dict[str, str]] = {}
+
+    for raw_value in raw_values:
+        text = str(raw_value or "").strip()
+        if not text:
+            continue
+        key = _resolve_output_category_key(text)
+        builtin = _OUTPUT_CATEGORY_LABELS_BY_KEY.get(key)
+        if builtin and text == key:
+            candidate = {"zh": str(builtin["zh"]), "en": str(builtin["en"])}
+        else:
+            candidate = {"zh": text, "en": text}
+
+        if key not in labels:
+            labels[key] = candidate
+            continue
+
+        current = labels[key]
+        if builtin and text != key and current == {"zh": str(builtin["zh"]), "en": str(builtin["en"])}:
+            labels[key] = candidate
+    return labels
+
+
+def _get_output_category_label(
+    category_key: Any,
+    labels: Dict[str, Dict[str, str]] | None = None,
+    lang: str = "zh",
+) -> str:
+    key = str(category_key or "").strip()
+    if not key:
+        return ""
+    language = "zh" if str(lang or "").strip().lower() == "zh" else "en"
+    source = labels or _OUTPUT_CATEGORY_LABELS_BY_KEY
+    item = source.get(key) or {}
+    text = str(item.get(language) or item.get("zh") or item.get("en") or key).strip()
+    return text or key
+
+
+def _normalize_output_category_labels_map(
+    labels: Dict[str, Dict[str, str]] | None,
+) -> Dict[str, Dict[str, str]]:
+    normalized: Dict[str, Dict[str, str]] = {}
+    for raw_key, raw_value in (labels or {}).items():
+        key = _resolve_output_category_key(raw_key)
+        if not key:
+            continue
+        if isinstance(raw_value, dict):
+            zh = str(raw_value.get("zh") or "").strip()
+            en = str(raw_value.get("en") or "").strip()
+        else:
+            zh = str(raw_value or "").strip()
+            en = zh
+        builtin = _OUTPUT_CATEGORY_LABELS_BY_KEY.get(key, {})
+        normalized[key] = {
+            "zh": zh or str(builtin.get("zh") or key),
+            "en": en or str(builtin.get("en") or zh or key),
+        }
+    for builtin_key, builtin_value in _OUTPUT_CATEGORY_LABELS_BY_KEY.items():
+        normalized.setdefault(builtin_key, {"zh": builtin_value["zh"], "en": builtin_value["en"]})
+    return normalized
+
+
+def _build_source_alias_map(*values: Any) -> Dict[str, str]:
+    alias_map: Dict[str, str] = {}
+    normalized_values = [str(value or "").strip() for value in values if str(value or "").strip()]
+    canonical_key = normalized_values[0] if normalized_values else ""
+    if not canonical_key:
+        return alias_map
+    for value in normalized_values:
+        alias = _normalize_lookup_text(value)
+        if alias and alias not in alias_map:
+            alias_map[alias] = canonical_key
+    return alias_map
+
+
+def _remap_category_keys_by_output_aliases(raw_mapping: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    remapped: Dict[str, List[str]] = {}
+    for raw_category, tags in (raw_mapping or {}).items():
+        category_key = _resolve_output_category_key(raw_category)
+        if not category_key:
+            continue
+        existing = list(remapped.get(category_key, []))
+        if isinstance(tags, list):
+            next_tags = [str(tag).strip() for tag in tags if str(tag).strip()]
+        else:
+            next_tags = _parse_tag_string(str(tags))
+        remapped[category_key] = _dedupe_string_list(existing + next_tags, unescape_parentheses=True)
+    return remapped
+
+
+def _build_output_category_lookup(bundle: Dict[str, Any]) -> Dict[str, str]:
+    lookup: Dict[str, str] = {}
+    for raw_category in (bundle or {}).keys():
+        category = str(raw_category or "").strip()
+        if not category:
+            continue
+        resolved_key = _resolve_output_category_key(category)
+        aliases = {
+            category,
+            resolved_key,
+            _get_output_category_label(resolved_key, None, "zh"),
+            _get_output_category_label(resolved_key, None, "en"),
+        }
+        for alias in aliases:
+            normalized = _normalize_lookup_text(alias)
+            if normalized and normalized not in lookup:
+                lookup[normalized] = category
+    return lookup
 
 
 def _parse_tag_string(tag_string: str) -> List[str]:
@@ -122,12 +307,15 @@ def _normalize_bundle_for_ui(tag_bundle: Dict[str, Any]) -> Dict[str, List[str]]
         return normalized
 
     for category, raw_tags in tag_bundle.items():
-        category_key = str(category)
+        category_key = _resolve_output_category_key(category)
+        if not category_key:
+            continue
         if isinstance(raw_tags, list):
             tags = [str(t).strip() for t in raw_tags if str(t).strip()]
         else:
             tags = _parse_tag_string(str(raw_tags))
-        normalized[category_key] = _dedupe_string_list(tags, unescape_parentheses=True)
+        existing = list(normalized.get(category_key, []))
+        normalized[category_key] = _dedupe_string_list(existing + tags, unescape_parentheses=True)
     return normalized
 
 
@@ -184,10 +372,7 @@ def _merge_manual_tags_into_bundle(
     normalized_bundle: Dict[str, List[str]],
     manual_category_tags_json: Any,
 ) -> Dict[str, List[str]]:
-    merged_bundle: Dict[str, List[str]] = {
-        str(category): list(tags)
-        for category, tags in (normalized_bundle or {}).items()
-    }
+    merged_bundle: Dict[str, List[str]] = _remap_category_keys_by_output_aliases(normalized_bundle)
 
     if isinstance(manual_category_tags_json, dict):
         manual_tags = manual_category_tags_json
@@ -205,28 +390,18 @@ def _merge_manual_tags_into_bundle(
     if not isinstance(manual_tags, dict):
         return merged_bundle
 
-    category_lookup: Dict[str, str] = {}
-    for category in merged_bundle.keys():
-        normalized_key = str(category).strip().lower()
-        if normalized_key and normalized_key not in category_lookup:
-            category_lookup[normalized_key] = category
-
     for raw_category, raw_tags in manual_tags.items():
-        category_key = str(raw_category or '').strip()
+        category_key = _resolve_output_category_key(raw_category)
         if not category_key:
             continue
-        resolved_category = category_lookup.get(category_key.lower(), category_key)
         if isinstance(raw_tags, list):
             next_tags = [str(tag).strip() for tag in raw_tags if str(tag).strip()]
         else:
             next_tags = _parse_tag_string(str(raw_tags))
         if not next_tags:
             continue
-        existing_tags = list(merged_bundle.get(resolved_category, []))
-        merged_bundle[resolved_category] = _dedupe_string_list(existing_tags + next_tags, unescape_parentheses=True)
-        normalized_key = resolved_category.strip().lower()
-        if normalized_key and normalized_key not in category_lookup:
-            category_lookup[normalized_key] = resolved_category
+        existing_tags = list(merged_bundle.get(category_key, []))
+        merged_bundle[category_key] = _dedupe_string_list(existing_tags + next_tags, unescape_parentheses=True)
 
     return merged_bundle
 
@@ -735,6 +910,134 @@ def _resolve_excel_path(excel_file: str) -> str:
     return os.path.join(data_base_dir, excel_file)
 
 
+def _build_source_file_signature(file_path: str) -> Dict[str, Any]:
+    abs_path = os.path.abspath(file_path or "")
+    signature: Dict[str, Any] = {"source_path": abs_path}
+    try:
+        stat_info = os.stat(abs_path)
+        signature["mtime_ns"] = int(stat_info.st_mtime_ns)
+        signature["size"] = int(stat_info.st_size)
+    except Exception:
+        pass
+    return signature
+
+
+def _get_tag_database_cache_dir() -> str:
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(current_dir, _TAG_DATABASE_CACHE_DIR_NAME)
+
+
+def _normalize_cache_file_name(raw_name: Any) -> str:
+    text = str(raw_name or "").strip()
+    normalized = re.sub(r'[^A-Za-z0-9._-]+', "_", text).strip("._")
+    return normalized[:80] or "tag_database"
+
+
+def _get_tag_database_cache_path(source_path: str) -> str:
+    abs_path = os.path.abspath(source_path or "")
+    name_hash = hashlib.md5(abs_path.encode("utf-8")).hexdigest()
+    file_name = _normalize_cache_file_name(os.path.basename(abs_path))
+    return os.path.join(_get_tag_database_cache_dir(), f"{file_name}.{name_hash}.pkl")
+
+
+def _empty_tag_database_payload() -> Dict[str, Dict[str, Any]]:
+    return {
+        "tag_db": {},
+        "source_category_aliases": {},
+        "source_subcategory_aliases": {},
+    }
+
+
+def _is_valid_tag_database_payload(payload: Any) -> bool:
+    return (
+        isinstance(payload, dict)
+        and isinstance(payload.get("tag_db"), dict)
+        and isinstance(payload.get("source_category_aliases"), dict)
+        and isinstance(payload.get("source_subcategory_aliases"), dict)
+    )
+
+
+def _store_tag_database_memory_cache(cache_key: str, payload: Dict[str, Any]) -> None:
+    if not cache_key or not _is_valid_tag_database_payload(payload):
+        return
+    _tag_cache.clear()
+    _tag_cache[cache_key] = payload
+
+
+def _load_tag_database_disk_cache(source_path: str, expected_signature: Dict[str, Any]) -> Dict[str, Any] | None:
+    cache_path = _get_tag_database_cache_path(source_path)
+    if not os.path.isfile(cache_path):
+        return None
+
+    try:
+        with open(cache_path, "rb") as f:
+            payload = pickle.load(f)
+    except Exception as e:
+        print(f"[DanbooruTagToolkit] Failed to load tag database cache: {e}")
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    if int(payload.get("cache_version", 0)) != _TAG_DATABASE_CACHE_VERSION:
+        return None
+    if payload.get("source_signature") != expected_signature:
+        return None
+
+    cached_payload = payload.get("payload")
+    if not _is_valid_tag_database_payload(cached_payload):
+        return None
+
+    print(f"[DanbooruTagToolkit] Loading tag database cache: {cache_path}")
+    return cached_payload
+
+
+def _save_tag_database_disk_cache(source_path: str, source_signature: Dict[str, Any], payload: Dict[str, Any]) -> None:
+    if not _is_valid_tag_database_payload(payload):
+        return
+
+    cache_dir = _get_tag_database_cache_dir()
+    cache_path = _get_tag_database_cache_path(source_path)
+    temp_path = f"{cache_path}.tmp"
+    wrapper = {
+        "cache_version": _TAG_DATABASE_CACHE_VERSION,
+        "source_signature": source_signature,
+        "payload": payload,
+    }
+
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(temp_path, "wb") as f:
+            pickle.dump(wrapper, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(temp_path, cache_path)
+    except Exception as e:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+        print(f"[DanbooruTagToolkit] Failed to save tag database cache: {e}")
+
+
+def _read_tag_database_table(source_path: str) -> pd.DataFrame:
+    usecols = lambda column_name: str(column_name or "").strip() in _TAG_DATABASE_REQUIRED_COLUMNS
+    read_kwargs = {
+        "dtype": str,
+        "usecols": usecols,
+    }
+    if str(source_path).lower().endswith(".csv"):
+        return pd.read_csv(source_path, **read_kwargs)
+    return pd.read_excel(source_path, **read_kwargs)
+
+
+def _get_table_cell(row: Any, column_index: Dict[str, int], column_name: str) -> Any:
+    index = column_index.get(column_name)
+    if index is None:
+        return ""
+    if index < 0 or index >= len(row):
+        return ""
+    return row[index]
+
+
 def _list_available_tag_files() -> List[str]:
     current_dir = os.path.dirname(os.path.abspath(__file__))
     data_base_dir = os.path.join(current_dir, "tags_database")
@@ -747,6 +1050,8 @@ def _list_available_tag_files() -> List[str]:
         for name in os.listdir(data_base_dir):
             full_path = os.path.join(data_base_dir, name)
             if not os.path.isfile(full_path):
+                continue
+            if str(name).startswith("~$"):
                 continue
             _, ext = os.path.splitext(name)
             if ext.lower() in allowed_ext:
@@ -924,6 +1229,18 @@ def _build_category_order(new_category_order: Any, default_category: str) -> Lis
     return ordered
 
 
+def _normalize_output_category_sequence(values: Iterable[Any]) -> List[str]:
+    normalized: List[str] = []
+    seen = set()
+    for raw_value in values or []:
+        key = _resolve_output_category_key(raw_value)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        normalized.append(key)
+    return normalized
+
+
 def _execute_sorting(
     tags: str,
     excel_file: str,
@@ -939,34 +1256,43 @@ def _execute_sorting(
 ):
     """
     统一执行分类逻辑，供旧 Sorter 节点、一体化节点、预览 API 复用。
-    返回 (all_str, cat_dict, final_excel_path, cat_map, cat_order)。
+    返回 (all_str, cat_dict, final_excel_path, cat_map, cat_order, output_category_labels)。
     """
-    t0 = time.perf_counter()
     default_category = str(default_category or "").strip() or "未归类词"
     final_excel_path = _resolve_excel_path(excel_file)
 
     cat_map = _parse_input_data(category_mapping, DEFAULT_MAPPING_TEXT, dict)
     parsed_order = _parse_input_data(new_category_order, DEFAULT_ORDER_TEXT, list)
     cat_order = _build_category_order(parsed_order, default_category)
-    t1 = time.perf_counter()
+    output_category_candidates: List[Any] = [default_category, *cat_order, *list(cat_map.values())]
+    output_category_labels = _build_output_category_labels(output_category_candidates)
 
     if validation:
-        used = set(cat_map.values())
-        defined = set(cat_order)
-        missing = used - defined
-        if missing:
+        used_keys = set(_normalize_output_category_sequence(cat_map.values()))
+        defined_keys = set(_normalize_output_category_sequence(cat_order))
+        missing_keys = used_keys - defined_keys
+        if missing_keys:
+            missing_labels = [
+                _get_output_category_label(category_key, output_category_labels, "zh")
+                for category_key in sorted(missing_keys)
+            ]
             print(
-                f"[DanbooruTagToolkit] Validation warning: mapping中存在未在order定义的分类 {list(missing)}，"
-                f"这些tag会在排序阶段落入默认分类 {default_category!r}。"
+                f"[DanbooruTagToolkit] Validation warning: mapping contains categories not present in order: "
+                f"{missing_labels}. These tags will fall back to default category {default_category!r}."
             )
 
     if force_reload:
         global _tag_cache
         _tag_cache.clear()
-    t2 = time.perf_counter()
 
-    sorter = DanbooruTagSorter(final_excel_path, cat_map, cat_order, default_category)
-    t3 = time.perf_counter()
+    sorter = DanbooruTagSorter(
+        final_excel_path,
+        cat_map,
+        cat_order,
+        default_category,
+        output_category_labels=output_category_labels,
+        comment_language="zh",
+    )
     all_str, cat_dict = sorter.process_tags(
         tags,
         is_comment,
@@ -974,25 +1300,10 @@ def _execute_sorting(
         tag_blacklist,
         deduplicate_tags
     )
-    t4 = time.perf_counter()
-    for category in cat_order:
+    normalized_cat_order = list(sorter.new_category_order)
+    for category in normalized_cat_order:
         cat_dict.setdefault(category, "")
-    t5 = time.perf_counter()
-    try:
-        print(
-            "[DanbooruTagToolkit] Sorting timing: "
-            f"parse={((t1 - t0) * 1000):.1f}ms, "
-            f"reload_check={((t2 - t1) * 1000):.1f}ms, "
-            f"sorter_init={((t3 - t2) * 1000):.1f}ms, "
-            f"process={((t4 - t3) * 1000):.1f}ms, "
-            f"post={((t5 - t4) * 1000):.1f}ms, "
-            f"total={((t5 - t0) * 1000):.1f}ms, "
-            f"cache_hit={getattr(sorter, '_last_cache_hit', None)}, "
-            f"tags_chars={len(str(tags or ''))}"
-        )
-    except Exception:
-        pass
-    return all_str, cat_dict, final_excel_path, cat_map, cat_order
+    return all_str, cat_dict, final_excel_path, sorter.category_mapping, normalized_cat_order, sorter.output_category_labels
 
 
 def _select_from_bundle(
@@ -1037,11 +1348,7 @@ def _select_from_bundle(
             if key not in tag_category_map:
                 tag_category_map[key] = category
 
-    category_name_map: Dict[str, str] = {}
-    for category in working_bundle.keys():
-        normalized_key = str(category).strip().lower()
-        if normalized_key and normalized_key not in category_name_map:
-            category_name_map[normalized_key] = category
+    category_name_map = _build_output_category_lookup(working_bundle)
 
     resolved_categories: List[str] = []
     seen_categories = set()
@@ -1444,13 +1751,123 @@ def _get_cached_gallery_image_tensor(image_url: str) -> torch.Tensor:
 
 # Sorter类
 class DanbooruTagSorter:
-    def __init__(self, excel_path, category_mapping, new_category_order, default_category="未归类词"):
+    def __init__(
+        self,
+        excel_path,
+        category_mapping,
+        new_category_order,
+        default_category="未归类词",
+        output_category_labels: Dict[str, Dict[str, str]] | None = None,
+        comment_language: str = "zh",
+    ):
         self.excel_path = excel_path
-        self.category_mapping = category_mapping  # 映射规则 {('原有大类', '原有小类'): '新分类名'}
-        self.new_category_order = new_category_order  # 定义输出时各个分类及各个分类的顺序
-        self.default_category = default_category
         self._last_cache_hit = False
-        self.tag_db = self._load_database_with_cache()  # 初始化立刻先尝试加载或从缓存获取数据库
+        self.comment_language = "zh" if str(comment_language or "").strip().lower() == "zh" else "en"
+        self.output_category_labels = _normalize_output_category_labels_map(output_category_labels)
+        self.output_category_aliases = self._build_output_category_aliases(self.output_category_labels)
+
+        db_payload = self._load_database_with_cache()  # 初始化立刻先尝试加载或从缓存获取数据库
+        self.tag_db = db_payload.get("tag_db", {})
+        self.source_category_aliases = db_payload.get("source_category_aliases", {})
+        self.source_subcategory_aliases = db_payload.get("source_subcategory_aliases", {})
+
+        self.default_category = self._normalize_output_category(default_category) or "uncategorized_terms"
+        self.output_category_labels.setdefault(
+            self.default_category,
+            {
+                "zh": _get_output_category_label(self.default_category, self.output_category_labels, "zh"),
+                "en": _get_output_category_label(self.default_category, self.output_category_labels, "en"),
+            },
+        )
+        self.new_category_order = self._normalize_category_order(new_category_order, self.default_category)
+        self.category_mapping = self._normalize_category_mapping(category_mapping)
+
+    def _build_output_category_aliases(self, labels: Dict[str, Dict[str, str]]) -> Dict[str, str]:
+        aliases = dict(_OUTPUT_CATEGORY_ALIAS_TO_KEY)
+        for raw_key, raw_value in (labels or {}).items():
+            key = str(raw_key or "").strip()
+            if not key:
+                continue
+            candidates = [key]
+            if isinstance(raw_value, dict):
+                candidates.extend([raw_value.get("zh", ""), raw_value.get("en", "")])
+            else:
+                candidates.append(str(raw_value or ""))
+            for candidate in candidates:
+                alias = _normalize_lookup_text(candidate)
+                if alias and alias not in aliases:
+                    aliases[alias] = key
+        return aliases
+
+    def _normalize_output_category(self, raw_value: Any) -> str:
+        text = str(raw_value or "").strip()
+        if not text:
+            return ""
+        alias = _normalize_lookup_text(text)
+        return self.output_category_aliases.get(alias, _resolve_output_category_key(text))
+
+    def _normalize_source_category(self, raw_value: Any) -> str:
+        text = str(raw_value or "").strip()
+        if not text:
+            return ""
+        alias = _normalize_lookup_text(text)
+        return self.source_category_aliases.get(alias, text)
+
+    def _normalize_source_subcategory(self, raw_value: Any) -> str:
+        text = str(raw_value or "").strip()
+        if not text:
+            return ""
+        if text == "*":
+            return "*"
+        alias = _normalize_lookup_text(text)
+        return self.source_subcategory_aliases.get(alias, text)
+
+    def _normalize_category_mapping(self, raw_mapping: Any) -> Dict[Any, str]:
+        normalized: Dict[Any, str] = {}
+        if not isinstance(raw_mapping, dict):
+            return normalized
+        for raw_key, raw_target in raw_mapping.items():
+            target_key = self._normalize_output_category(raw_target)
+            if not target_key:
+                continue
+            self.output_category_labels.setdefault(
+                target_key,
+                {
+                    "zh": _get_output_category_label(target_key, self.output_category_labels, "zh"),
+                    "en": _get_output_category_label(target_key, self.output_category_labels, "en"),
+                },
+            )
+            if isinstance(raw_key, tuple) and len(raw_key) >= 2:
+                category_key = self._normalize_source_category(raw_key[0])
+                subcategory_key = self._normalize_source_subcategory(raw_key[1])
+                if category_key:
+                    normalized[(category_key, subcategory_key)] = target_key
+            else:
+                category_key = self._normalize_source_category(raw_key)
+                if category_key:
+                    normalized[category_key] = target_key
+        return normalized
+
+    def _normalize_category_order(self, raw_order: Any, default_category: str) -> List[str]:
+        ordered: List[str] = []
+        seen = set()
+        if isinstance(raw_order, list):
+            for item in raw_order:
+                key = self._normalize_output_category(item)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                ordered.append(key)
+                self.output_category_labels.setdefault(
+                    key,
+                    {
+                        "zh": _get_output_category_label(key, self.output_category_labels, "zh"),
+                        "en": _get_output_category_label(key, self.output_category_labels, "en"),
+                    },
+                )
+        if default_category and default_category not in seen:
+            ordered.append(default_category)
+        return ordered
 
     # 根据原始的大类小类查表，得到新的分类名
     def get_new_category(self, original_category, original_subcategory):
@@ -1474,16 +1891,7 @@ class DanbooruTagSorter:
     def _generate_cache_key(self):
         # 缓存只与“数据库文件内容”相关，不随 mapping/order/default_category 变化。
         # 这样切换配置时不会重复读取 xlsx。
-        abs_excel_path = os.path.abspath(self.excel_path or "")
-        params = {
-            "excel_path": abs_excel_path,
-        }
-        try:
-            st = os.stat(abs_excel_path)
-            params["excel_mtime_ns"] = int(st.st_mtime_ns)
-            params["excel_size"] = int(st.st_size)
-        except Exception:
-            pass
+        params = _build_source_file_signature(self.excel_path)
         params_str = json.dumps(params, sort_keys=True)
         hasher = hashlib.md5(params_str.encode(encoding='utf-8')).hexdigest()
         # 返回MD5
@@ -1495,30 +1903,45 @@ class DanbooruTagSorter:
         # 检查缓存是否命中
         if cache_key in _tag_cache:
             self._last_cache_hit = True
-            print(f"从缓存加载数据库喵:{self.excel_path}")
             return _tag_cache[cache_key]
         self._last_cache_hit = False
-        print(f"正在读取数据库喵:{self.excel_path} ...")  # 如果缓存未命中，则读取数据库
+        print(f"[DanbooruTagToolkit] Loading tag database: {self.excel_path}")
 
         # 基础校验
         if not self.excel_path or not os.path.exists(self.excel_path):
-            print(f"警告喵：找不到文件或路径为空喵 {self.excel_path}")
-            return {}
+            print(f"[DanbooruTagToolkit] Warning: tag database file not found: {self.excel_path}")
+            return _empty_tag_database_payload()
+
+        source_signature = _build_source_file_signature(self.excel_path)
+        disk_cached_payload = _load_tag_database_disk_cache(self.excel_path, source_signature)
+        if disk_cached_payload is not None:
+            self._last_cache_hit = True
+            _store_tag_database_memory_cache(cache_key, disk_cached_payload)
+            print(f"[DanbooruTagToolkit] Tag database cache loaded: {len(disk_cached_payload.get('tag_db', {}))} tags")
+            return disk_cached_payload
 
         try:
-            #读取csv或者excel文件
-            if self.excel_path.endswith('.csv'):
-                df = pd.read_csv(self.excel_path)
-            else:
-                df = pd.read_excel(self.excel_path)
+            df = _read_tag_database_table(self.excel_path)
+            column_names = [str(name or "").strip() for name in df.columns]
+            column_index = {name: idx for idx, name in enumerate(column_names)}
 
             tag_db = {}
+            source_category_aliases: Dict[str, str] = {}
+            source_subcategory_aliases: Dict[str, str] = {}
+            seen_source_categories = set()
+            seen_source_subcategories = set()
             #遍历每一行，构建哈希表查询
-            for index, row in df.iterrows():
+            for rank, row in enumerate(df.itertuples(index=False, name=None)):
                 #清洗，转小写、去空格
-                eng_tag = _clean_sheet_text(row.get('english', '')).lower()
-                cat = _clean_sheet_text(row.get('category', ''))
-                sub = _clean_sheet_text(row.get('subcategory', ''))
+                eng_tag = _clean_sheet_text(_get_table_cell(row, column_index, 'english')).lower()
+                category_legacy = _clean_sheet_text(_get_table_cell(row, column_index, 'category'))
+                subcategory_legacy = _clean_sheet_text(_get_table_cell(row, column_index, 'subcategory'))
+                category_key = _clean_sheet_text(_get_table_cell(row, column_index, 'category_key')) or category_legacy
+                subcategory_key = _clean_sheet_text(_get_table_cell(row, column_index, 'subcategory_key')) or subcategory_legacy
+                category_zh = _clean_sheet_text(_get_table_cell(row, column_index, 'category_zh')) or category_legacy
+                category_en = _clean_sheet_text(_get_table_cell(row, column_index, 'category_en')) or category_zh or category_key
+                subcategory_zh = _clean_sheet_text(_get_table_cell(row, column_index, 'subcategory_zh')) or subcategory_legacy
+                subcategory_en = _clean_sheet_text(_get_table_cell(row, column_index, 'subcategory_en')) or subcategory_zh or subcategory_key
                 if not eng_tag:
                     continue
 
@@ -1526,28 +1949,44 @@ class DanbooruTagSorter:
                 clean_key = eng_tag.replace('_', ' ')
                 tag_db[clean_key] = {
                     'original': eng_tag,
-                    'original_category': cat,
-                    'original_subcategory': sub,
-                    'rank': index
+                    'original_category': category_key,
+                    'original_subcategory': subcategory_key,
+                    'rank': rank,
                 }
-            print(f"数据库加载完成喵，共索引{len(tag_db)}个 Tags喵。")
+
+                normalized_category = _normalize_lookup_text(category_key)
+                if normalized_category and normalized_category not in seen_source_categories:
+                    seen_source_categories.add(normalized_category)
+                    source_category_aliases.update(
+                        _build_source_alias_map(category_key, category_legacy, category_zh, category_en)
+                    )
+
+                normalized_subcategory = _normalize_lookup_text(subcategory_key)
+                if normalized_subcategory and normalized_subcategory not in seen_source_subcategories:
+                    seen_source_subcategories.add(normalized_subcategory)
+                    source_subcategory_aliases.update(
+                        _build_source_alias_map(subcategory_key, subcategory_legacy, subcategory_zh, subcategory_en)
+                    )
+            print(f"[DanbooruTagToolkit] Tag database loaded: {len(tag_db)} tags")
 
             # 存入全局缓存dict
-            _tag_cache[cache_key] = tag_db
-            return tag_db
+            cache_payload = {
+                "tag_db": tag_db,
+                "source_category_aliases": source_category_aliases,
+                "source_subcategory_aliases": source_subcategory_aliases,
+            }
+            _save_tag_database_disk_cache(self.excel_path, source_signature, cache_payload)
+            _store_tag_database_memory_cache(cache_key, cache_payload)
+            return cache_payload
         except Exception as e:
-            print(f"读取数据库文件失败喵，请检查路径是否填写正确喵: {e}")
-            return {}
+            print(f"[DanbooruTagToolkit] Failed to read tag database: {e}")
+            return _empty_tag_database_payload()
 
     # 处理输入的Prompt字符串
     def process_tags(self, raw_string, add_category_comment=True,
                      regex_blacklist="", tag_blacklist="",
                      deduplicate=False):
         raw_string = _extract_tags_text_from_payload(raw_string)
-        print(
-            f"[DanbooruTagToolkit] Sorter input debug: chars={len(raw_string)}, "
-            f"preview={raw_string[:120]!r}"
-        )
         # 拆分输入字符串转列表
         input_tags = [t.strip() for t in raw_string.split(',') if t.strip()]
 
@@ -1577,7 +2016,7 @@ class DanbooruTagSorter:
             try:
                 regex_pattern = re.compile(regex_blacklist, re.IGNORECASE)
             except re.error as e:
-                print(f"正则表达式写错了喵:{e}")
+                print(f"[DanbooruTagToolkit] Invalid regex_blacklist pattern: {e}")
         #初始化分类桶
         new_category_buckets = defaultdict(list)
         unmatched_tags = []
@@ -1637,7 +2076,9 @@ class DanbooruTagSorter:
                 categorized_tags[category] = tags_str  # 存入dict
                 # 拼接最终
                 if add_category_comment:
-                    final_lines.append(f"{category}:")  # 添加 "新分类名:" 注释
+                    final_lines.append(
+                        f"{_get_output_category_label(category, self.output_category_labels, self.comment_language)}:"
+                    )
                 final_lines.append(tags_str)
                 # 处理完后从桶中删除，后续可以处理剩余分类
                 del new_category_buckets[category]
@@ -1650,7 +2091,9 @@ class DanbooruTagSorter:
                 categorized_tags[target_unk] = ""
             categorized_tags[target_unk] += unmatched_str  #追加到默认
             if add_category_comment:
-                final_lines.append(f"{target_unk}:")
+                final_lines.append(
+                    f"{_get_output_category_label(target_unk, self.output_category_labels, self.comment_language)}:"
+                )
             final_lines.append(unmatched_str)
         return "\n".join(final_lines), categorized_tags
 
@@ -1742,7 +2185,7 @@ class DanbooruTagSorterSelectorNode:
         selected_tag_weights_json="{}",
         unique_id=None,
     ):
-        all_str, cat_dict, _, _, _ = _execute_sorting(
+        all_str, cat_dict, _, _, _, output_category_labels = _execute_sorting(
             tags=tags,
             excel_file=excel_file,
             category_mapping=category_mapping,
@@ -1770,7 +2213,10 @@ class DanbooruTagSorterSelectorNode:
         )
 
         if unique_id is not None:
-            _latest_tag_bundle_by_node[str(unique_id)] = normalized_bundle
+            _latest_tag_bundle_by_node[str(unique_id)] = {
+                "categories": normalized_bundle,
+                "category_labels": output_category_labels,
+            }
 
         prefix_text = str(prefix_text or "").strip()
         if prefix_text and selected_text:
@@ -1838,7 +2284,6 @@ class DanbooruTagGalleryLiteNode:
             return ([_empty_image_tensor()], [""], "")
 
         # 可选安全阈值：当 _GALLERY_OUTPUT_SELECTION_LIMIT > 0 时限制输出数量。
-        raw_count = len(selections)
         if _GALLERY_OUTPUT_SELECTION_LIMIT > 0 and len(selections) > _GALLERY_OUTPUT_SELECTION_LIMIT:
             selections = selections[-_GALLERY_OUTPUT_SELECTION_LIMIT:]
 
@@ -1898,12 +2343,6 @@ class DanbooruTagGalleryLiteNode:
                 seen_prompt_tags.add(key)
                 merged_prompt_tags.append(tag)
         merged_prompt = ", ".join(merged_prompt_tags)
-        first_prompt = normalized_prompts[0] if normalized_prompts else ""
-        print(
-            f"[DanbooruTagToolkit] Gallery output debug: raw_selections={raw_count}, "
-            f"used={len(selections)}, prompts_out={len(prompts)}, "
-            f"first_prompt_preview={first_prompt[:120]!r}"
-        )
         return (images, normalized_prompts, merged_prompt)
 
 
@@ -1982,20 +2421,21 @@ if PromptServer is not None and web is not None:
         @PromptServer.instance.routes.get("/danbooru_tag_picker/latest")
         async def get_latest_bundle_for_selector(request):
             node_id = str(request.query.get("node_id", "")).strip()
-            categories = _latest_tag_bundle_by_node.get(node_id, {})
+            payload = _latest_tag_bundle_by_node.get(node_id, {}) if node_id else {}
+            categories = payload.get("categories", {}) if isinstance(payload, dict) else {}
+            category_labels = payload.get("category_labels", {}) if isinstance(payload, dict) else {}
             return web.json_response({
                 "status": "success",
                 "node_id": node_id,
                 "categories": categories,
+                "category_labels": category_labels,
                 "category_count": len(categories),
             })
 
         @PromptServer.instance.routes.post("/danbooru_tag_picker/preview")
         async def preview_bundle_for_selector(request):
             try:
-                preview_t0 = time.perf_counter()
                 data = await request.json()
-                preview_t1 = time.perf_counter()
                 node_id = str(data.get("node_id", "")).strip()
 
                 tags = str(data.get("tags", ""))
@@ -2010,7 +2450,7 @@ if PromptServer is not None and web is not None:
                 force_reload = _as_bool(data.get("force_reload", False), False)
                 is_comment = _as_bool(data.get("is_comment", True), True)
 
-                all_str, cat_dict, _, _, _ = _execute_sorting(
+                all_str, cat_dict, _, _, _, output_category_labels = _execute_sorting(
                     tags=tags,
                     excel_file=excel_file,
                     category_mapping=category_mapping,
@@ -2025,27 +2465,17 @@ if PromptServer is not None and web is not None:
                 )
 
                 normalized = _normalize_bundle_for_ui(cat_dict)
-                preview_t2 = time.perf_counter()
                 if node_id:
-                    _latest_tag_bundle_by_node[node_id] = normalized
-                preview_t3 = time.perf_counter()
-                try:
-                    total_tags = sum(len(v) for v in normalized.values())
-                    print(
-                        "[DanbooruTagToolkit] Preview API timing: "
-                        f"json={((preview_t1 - preview_t0) * 1000):.1f}ms, "
-                        f"sort+normalize={((preview_t2 - preview_t1) * 1000):.1f}ms, "
-                        f"cache_store={((preview_t3 - preview_t2) * 1000):.1f}ms, "
-                        f"total={((preview_t3 - preview_t0) * 1000):.1f}ms, "
-                        f"cats={len(normalized)}, tags={total_tags}, node={node_id or '-'}"
-                    )
-                except Exception:
-                    pass
+                    _latest_tag_bundle_by_node[node_id] = {
+                        "categories": normalized,
+                        "category_labels": output_category_labels,
+                    }
 
                 return web.json_response({
                     "status": "success",
                     "node_id": node_id,
                     "categories": normalized,
+                    "category_labels": output_category_labels,
                     "all_tags": all_str,
                     "category_count": len(normalized),
                 })
@@ -2213,7 +2643,7 @@ if PromptServer is not None and web is not None:
                 },
             })
     except Exception as e:
-        print(f"[DanbooruTagToolkit] selector API 注册失败: {e}")
+        print(f"[DanbooruTagToolkit] Failed to register selector API routes: {e}")
 
 
 # Registration 我的回合！注册！

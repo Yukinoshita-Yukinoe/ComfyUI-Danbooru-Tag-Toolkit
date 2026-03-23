@@ -7,6 +7,11 @@ const STYLE_ID = "danbooru-tag-selector-style";
 const MAX_UI_NODE_HEIGHT = 2000;
 const DANBOORU_AUTOCOMPLETE_CACHE = new Map();
 const DANBOORU_AUTOCOMPLETE_CACHE_TTL_MS = 60 * 1000;
+const DEFAULT_SORTER_PROFILE_BY_LANG = Object.freeze({
+    zh: "zh_default",
+    en: "en_default",
+});
+const BUILT_IN_DEFAULT_SORTER_PROFILES = new Set(Object.values(DEFAULT_SORTER_PROFILE_BY_LANG));
 const I18N = {
     en: {
         title_integrated: "Danbooru Tag Toolkit - All-in-One",
@@ -1403,14 +1408,96 @@ function normalizeCategories(input) {
     return result;
 }
 
-function resolveCategoryName(categories, targetCategory) {
-    const targetKey = normalizeCategory(targetCategory);
-    for (const category of Object.keys(categories || {})) {
-        if (normalizeCategory(category) === targetKey) {
-            return category;
+function normalizeCategoryLabels(input, categories = {}) {
+    const result = {};
+    if (input && typeof input === "object") {
+        for (const [category, rawValue] of Object.entries(input)) {
+            const key = String(category || "").trim();
+            if (!key) continue;
+            if (rawValue && typeof rawValue === "object" && !Array.isArray(rawValue)) {
+                const zh = String(rawValue.zh || "").trim();
+                const en = String(rawValue.en || "").trim();
+                result[key] = {
+                    zh: zh || key,
+                    en: en || zh || key,
+                };
+            } else {
+                const text = String(rawValue || "").trim() || key;
+                result[key] = { zh: text, en: text };
+            }
         }
     }
-    return String(targetCategory || "").trim();
+    Object.keys(categories || {}).forEach(category => {
+        if (!result[category]) {
+            result[category] = { zh: category, en: category };
+        }
+    });
+    return result;
+}
+
+function buildCategoryAliasLookup(categories, categoryLabels = {}) {
+    const lookup = {};
+    Object.keys(categories || {}).forEach(category => {
+        const labelInfo = categoryLabels?.[category] || {};
+        [category, labelInfo.zh, labelInfo.en].forEach(value => {
+            const alias = normalizeCategory(value);
+            if (alias && !(alias in lookup)) {
+                lookup[alias] = category;
+            }
+        });
+    });
+    return lookup;
+}
+
+function getCategoryDisplayLabel(state, category) {
+    const key = String(category || "").trim();
+    if (!key) return "";
+    const info = state?.categoryLabels?.[key] || {};
+    const lang = state?.lang === "zh" ? "zh" : "en";
+    return String(info[lang] || info.zh || info.en || key);
+}
+
+function resolveCategoryName(categories, targetCategory, categoryLabels = {}) {
+    const targetKey = normalizeCategory(targetCategory);
+    const aliasLookup = buildCategoryAliasLookup(categories, categoryLabels);
+    return aliasLookup[targetKey] || String(targetCategory || "").trim();
+}
+
+function remapCategoryArray(values, state) {
+    const aliasLookup = buildCategoryAliasLookup(state?.categories || {}, state?.categoryLabels || {});
+    const result = [];
+    const seen = new Set();
+    (Array.isArray(values) ? values : []).forEach(value => {
+        const resolved = aliasLookup[normalizeCategory(value)] || String(value || "").trim();
+        const normalized = normalizeCategory(resolved);
+        if (!normalized || seen.has(normalized)) return;
+        seen.add(normalized);
+        result.push(resolved);
+    });
+    return result;
+}
+
+function remapCategoryObjectKeys(rawMap, state) {
+    const aliasLookup = buildCategoryAliasLookup(state?.categories || {}, state?.categoryLabels || {});
+    const result = {};
+    for (const [rawKey, rawValue] of Object.entries(rawMap || {})) {
+        const resolved = aliasLookup[normalizeCategory(rawKey)] || String(rawKey || "").trim();
+        if (!resolved) continue;
+        result[resolved] = rawValue;
+    }
+    return result;
+}
+
+function remapCategoryState(state) {
+    if (!state) return;
+    state.selectedCategories = remapCategoryArray(state.selectedCategories || [], state);
+    state.categoryOrder = remapCategoryArray(state.categoryOrder || [], state);
+    state.manualCategoryTags = remapCategoryObjectKeys(state.manualCategoryTags || {}, state);
+    state.selectedCategoryWeights = remapCategoryObjectKeys(state.selectedCategoryWeights || {}, state);
+    if (state.categoryFilter && state.categoryFilter !== "__all") {
+        const aliasLookup = buildCategoryAliasLookup(state.categories || {}, state.categoryLabels || {});
+        state.categoryFilter = aliasLookup[normalizeCategory(state.categoryFilter)] || "__all";
+    }
 }
 
 function syncManualTagsWidget(node, markDirty = true) {
@@ -1427,7 +1514,7 @@ function applyManualTagsToCategories(state) {
     const manual = state?.manualCategoryTags || {};
     if (!state || !manual || typeof manual !== "object") return;
     for (const [category, tags] of Object.entries(manual)) {
-        const resolvedCategory = resolveCategoryName(state.categories || {}, category);
+        const resolvedCategory = resolveCategoryName(state.categories || {}, category, state.categoryLabels || {});
         const existing = Array.isArray(state.categories?.[resolvedCategory]) ? [...state.categories[resolvedCategory]] : [];
         const seen = new Set(existing.map(normalizeTag));
         splitTagText(tags).forEach(tag => {
@@ -1445,7 +1532,7 @@ function applyManualTagsToCategories(state) {
 function addManualTagsToCategory(node, category, rawTags) {
     const state = node.__dtsState;
     if (!state) return;
-    const resolvedCategory = resolveCategoryName(state.categories || {}, category);
+    const resolvedCategory = resolveCategoryName(state.categories || {}, category, state.categoryLabels || {});
     const nextTags = splitTagText(rawTags);
     if (!nextTags.length) return;
 
@@ -1521,13 +1608,7 @@ function getSelectedByCategory(state) {
 }
 
 function getExplicitSelectedCategories(state) {
-    const categoryLookup = {};
-    for (const category of Object.keys(state.categories || {})) {
-        const key = normalizeCategory(category);
-        if (!(key in categoryLookup)) {
-            categoryLookup[key] = category;
-        }
-    }
+    const categoryLookup = buildCategoryAliasLookup(state.categories || {}, state.categoryLabels || {});
 
     const selected = [];
     const seen = new Set();
@@ -1549,13 +1630,7 @@ function getActiveSelectedCategories(state) {
         ...explicitSelected.map(normalizeCategory),
     ]);
 
-    const categoryLookup = {};
-    for (const category of Object.keys(state.categories || {})) {
-        const key = normalizeCategory(category);
-        if (!(key in categoryLookup)) {
-            categoryLookup[key] = category;
-        }
-    }
+    const categoryLookup = buildCategoryAliasLookup(state.categories || {}, state.categoryLabels || {});
 
     const ordered = [];
     const seen = new Set();
@@ -2290,6 +2365,29 @@ function normalizeDefaultCategoryValue(rawValue, fallback = "未归类词") {
     return text || fallback;
 }
 
+function getLanguageDefaultProfileName(lang) {
+    return DEFAULT_SORTER_PROFILE_BY_LANG[lang === "zh" ? "zh" : "en"];
+}
+
+function isBuiltInDefaultProfileName(profileName) {
+    const normalized = String(profileName || "").trim();
+    return BUILT_IN_DEFAULT_SORTER_PROFILES.has(normalized);
+}
+
+async function ensureLanguageDefaultProfile(node, options = {}) {
+    const state = node.__dtsState;
+    if (!state) return false;
+
+    const currentProfile = String(getWidgetValue(node, "config_profile", "") || "").trim();
+    const targetProfile = getLanguageDefaultProfileName(state.lang);
+    const canAutoSwitch = !currentProfile || isBuiltInDefaultProfileName(currentProfile);
+    if (!canAutoSwitch) return false;
+    if (currentProfile === targetProfile && !options.forceDefaultSwitch) return false;
+
+    await loadProfileIntoSettings(node, targetProfile, { silent: options.silent === true });
+    return true;
+}
+
 async function reloadExcelFileOptions(node, preferredValue = "", silent = false) {
     const state = node.__dtsState;
     const select = state?.settingsControls?.excelSelect;
@@ -2342,9 +2440,10 @@ async function reloadProfileOptions(node, preferredName = "", silent = false) {
     }
 }
 
-async function loadProfileIntoSettings(node, profileName) {
+async function loadProfileIntoSettings(node, profileName, options = {}) {
     const state = node.__dtsState;
     const targetName = String(profileName || "").trim();
+    const silent = options.silent === true;
     if (!state || !targetName) return;
 
     try {
@@ -2374,9 +2473,13 @@ async function loadProfileIntoSettings(node, profileName) {
         } else {
             renderPreview(node);
         }
-        setStatus(node, "status_profile_loaded", { name: targetName });
+        if (!silent) {
+            setStatus(node, "status_profile_loaded", { name: targetName });
+        }
     } catch (error) {
-        setStatus(node, "status_profile_load_failed");
+        if (!silent) {
+            setStatus(node, "status_profile_load_failed");
+        }
         console.error("[DanbooruTagToolkit] failed to load profile:", error);
     }
 }
@@ -2488,7 +2591,11 @@ async function refreshCategories(node) {
                     const latestCategories = normalizeCategories(latestData.categories || {});
                     if (Object.keys(latestCategories).length > 0) {
                         source = "latest";
-                        payload = { ...latestData, categories: latestCategories };
+                        payload = {
+                            ...latestData,
+                            categories: latestCategories,
+                            category_labels: normalizeCategoryLabels(latestData.category_labels || {}, latestCategories),
+                        };
                         state.lastPreviewSignature = previewSignature;
                     }
                 } catch {
@@ -2507,6 +2614,7 @@ async function refreshCategories(node) {
                 state.lastPreviewSignature = previewSignature;
 
                 const mergedCategories = normalizeCategories(previewData.categories || {});
+                let mergedCategoryLabels = normalizeCategoryLabels(previewData.category_labels || {}, mergedCategories);
 
                 // 输入 tags 为空（例如 WD14 连线场景）时，优先保留分类骨架，再尝试用最新缓存填充真实 tags。
                 if (!previewInfo.previewText.length) {
@@ -2518,6 +2626,7 @@ async function refreshCategories(node) {
                         );
                         networkMs += performance.now() - tNet0;
                         const latestCategories = normalizeCategories(latestData.categories || {});
+                        const latestCategoryLabels = normalizeCategoryLabels(latestData.category_labels || {}, latestCategories);
                         if (Object.keys(latestCategories).length > 0) {
                             const skeletonLookup = {};
                             for (const category of Object.keys(mergedCategories)) {
@@ -2537,6 +2646,10 @@ async function refreshCategories(node) {
                             }
                             if (hasFilledAny) {
                                 source = "latest";
+                                mergedCategoryLabels = {
+                                    ...mergedCategoryLabels,
+                                    ...latestCategoryLabels,
+                                };
                             }
                         }
                     } catch {
@@ -2544,7 +2657,11 @@ async function refreshCategories(node) {
                     }
                 }
 
-                payload = { ...previewData, categories: mergedCategories };
+                payload = {
+                    ...previewData,
+                    categories: mergedCategories,
+                    category_labels: mergedCategoryLabels,
+                };
             }
         } else {
             const tNet0 = performance.now();
@@ -2557,6 +2674,8 @@ async function refreshCategories(node) {
         if (requestId !== state.refreshRequestId) return;
         const tBeforeRender = performance.now();
         state.categories = normalizeCategories(payload.categories || {});
+        state.categoryLabels = normalizeCategoryLabels(payload.category_labels || {}, state.categories);
+        remapCategoryState(state);
         applyManualTagsToCategories(state);
 
         pruneSelectionByAvailability(state);
@@ -2721,7 +2840,7 @@ function setCategoryRowWeight(node, category, rawWeight) {
     const state = node.__dtsState;
     if (!state) return 1;
 
-    const resolvedCategory = resolveCategoryName(state.categories || {}, category);
+    const resolvedCategory = resolveCategoryName(state.categories || {}, category, state.categoryLabels || {});
     if (!resolvedCategory) return 1;
 
     if (!state.selectedCategoryWeights || typeof state.selectedCategoryWeights !== "object") {
@@ -2792,7 +2911,7 @@ function resetCategoryTagWeights(node, category) {
     const state = node.__dtsState;
     if (!state) return;
 
-    const resolvedCategory = resolveCategoryName(state.categories || {}, category);
+    const resolvedCategory = resolveCategoryName(state.categories || {}, category, state.categoryLabels || {});
     if (!resolvedCategory || !state.selectedTagWeights || typeof state.selectedTagWeights !== "object") return;
 
     const removeSet = new Set((state.categories[resolvedCategory] || []).map(normalizeTag));
@@ -2826,7 +2945,7 @@ function renderCategoryFilter(node) {
     categories.forEach(cat => {
         const option = document.createElement("option");
         option.value = cat;
-        option.textContent = `${cat} (${state.categories[cat].length})`;
+        option.textContent = `${getCategoryDisplayLabel(state, cat)} (${state.categories[cat].length})`;
         select.appendChild(option);
     });
 
@@ -2869,7 +2988,7 @@ function renderCategories(node) {
 
         const title = document.createElement("div");
         title.className = "dts-category-name";
-        title.textContent = `${category} (${categories[category].length})`;
+        title.textContent = `${getCategoryDisplayLabel(state, category)} (${categories[category].length})`;
 
         const actions = document.createElement("div");
         actions.className = "dts-small-actions";
@@ -3008,7 +3127,7 @@ function renderSelected(node) {
 
         const rowTitle = document.createElement("div");
         rowTitle.className = "dts-selected-title";
-        rowTitle.textContent = `${category} (${tags.length})`;
+        rowTitle.textContent = `${getCategoryDisplayLabel(state, category)} (${tags.length})`;
 
         const rowText = document.createElement("div");
         rowText.className = "dts-selected-line";
@@ -4134,6 +4253,7 @@ app.registerExtension({
                 availableExcelFiles: [],
                 availableProfiles: [],
                 categories: {},
+                categoryLabels: {},
                 selected: parseSelected(selectedWidget?.value),
                 selectedCategories: parseSelected(selectedCategoriesWidget?.value),
                 manualCategoryTags: parseManualCategoryTags(manualCategoryTagsWidget?.value),
@@ -4174,9 +4294,16 @@ app.registerExtension({
             const settingsPanel = createSettingsPanel(this);
             this.__dtsState.settingsPanel = settingsPanel;
             root.appendChild(settingsPanel);
+            const bootstrapProfileDefaults = async () => {
+                await reloadExcelFileOptions(this, String(getWidgetValue(this, "excel_file", "danbooru_tags.xlsx") || ""), true);
+                await reloadProfileOptions(this, String(getWidgetValue(this, "config_profile", "") || ""), true);
+                const didApplyDefaultProfile = await ensureLanguageDefaultProfile(this, { silent: true });
+                if (!didApplyDefaultProfile) {
+                    refreshCategories(this);
+                }
+            };
+
             syncSettingsFromWidgets(this);
-            reloadExcelFileOptions(this, String(getWidgetValue(this, "excel_file", "danbooru_tags.xlsx") || ""), true);
-            reloadProfileOptions(this, String(getWidgetValue(this, "config_profile", "") || ""), true);
 
             refreshBtn.onclick = () => refreshCategories(this);
             settingsBtn.onclick = () => {
@@ -4188,10 +4315,15 @@ app.registerExtension({
                     reloadProfileOptions(this, String(getWidgetValue(this, "config_profile", "") || ""), true);
                 }
             };
-            langBtn.onclick = () => {
+            langBtn.onclick = async () => {
                 const state = this.__dtsState;
                 state.lang = state.lang === "zh" ? "en" : "zh";
                 applyLanguage(this);
+                try {
+                    await ensureLanguageDefaultProfile(this, { forceDefaultSwitch: true, silent: true });
+                } catch (error) {
+                    console.error("[DanbooruTagToolkit] failed to switch language default profile:", error);
+                }
             };
             clearBtn.onclick = () => {
                 const state = this.__dtsState;
@@ -4238,7 +4370,10 @@ app.registerExtension({
             scheduleRootLayoutSync(this);
             applyLanguage(this, false);
             renderAll(this);
-            refreshCategories(this);
+            bootstrapProfileDefaults().catch(error => {
+                console.error("[DanbooruTagToolkit] failed to bootstrap profile defaults:", error);
+                refreshCategories(this);
+            });
             return result;
         };
 

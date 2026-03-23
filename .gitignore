@@ -5,6 +5,12 @@
 .DS_Store
 .idea/
 .vscode/
+.tag_db_cache/
+scripts/__pycache__/
+tags_database/~$*.xlsx
+sorter_presets/*.json
+!sorter_presets/zh_default.json
+!sorter_presets/en_default.json
 prompt_selector/data.json
 prompt_selector/data.json.backup_*
 prompt_selector/preview/

@@ -1,0 +1,573 @@
+{
+  "meta": {
+    "generated_at": "2026-03-19T02:56:15.532896+00:00",
+    "source_files": [
+      "danbooru_tags.xlsx",
+      "danbooru_tags_2509.xlsx"
+    ],
+    "instructions": [
+      "Edit key/zh/en values for category and subcategory entries.",
+      "Keep keys stable after workflows start using them.",
+      "Then run: python scripts/translate_tag_workbooks.py migrate"
+    ]
+  },
+  "category": {
+    "二次元角色": {
+      "key": "cat_001",
+      "zh": "二次元角色",
+      "en": "Anime Character"
+    },
+    "人物": {
+      "key": "cat_002",
+      "zh": "人物",
+      "en": "Person"
+    },
+    "场景": {
+      "key": "cat_003",
+      "zh": "场景",
+      "en": "Scene"
+    },
+    "无法分类": {
+      "key": "cat_004",
+      "zh": "无法分类",
+      "en": "Uncategorized"
+    },
+    "服饰": {
+      "key": "cat_005",
+      "zh": "服饰",
+      "en": "Clothing"
+    },
+    "物品": {
+      "key": "cat_006",
+      "zh": "物品",
+      "en": "Items"
+    },
+    "环境": {
+      "key": "cat_007",
+      "zh": "环境",
+      "en": "Environment"
+    },
+    "画面": {
+      "key": "cat_008",
+      "zh": "画面",
+      "en": "Artwork"
+    },
+    "艺术家": {
+      "key": "cat_009",
+      "zh": "艺术家",
+      "en": "Artist"
+    },
+    "表情动作": {
+      "key": "cat_010",
+      "zh": "表情动作",
+      "en": "Expressions & Actions"
+    },
+    "镜头": {
+      "key": "cat_011",
+      "zh": "镜头",
+      "en": "Camera"
+    },
+    "Artist": {
+      "key": "cat_artist",
+      "zh": "Artist",
+      "en": "Artist"
+    },
+    "Character": {
+      "key": "cat_character",
+      "zh": "Character",
+      "en": "Character"
+    },
+    "Copyright": {
+      "key": "cat_copyright",
+      "zh": "Copyright",
+      "en": "Copyright"
+    },
+    "General": {
+      "key": "cat_general",
+      "zh": "General",
+      "en": "General"
+    },
+    "Meta": {
+      "key": "cat_meta",
+      "zh": "Meta",
+      "en": "Meta"
+    }
+  },
+  "subcategory": {
+    "6": {
+      "key": "subcat_6",
+      "zh": "6",
+      "en": "6"
+    },
+    "上半身服装": {
+      "key": "subcat_002",
+      "zh": "上半身服装",
+      "en": "Upper-body Clothing"
+    },
+    "不开心": {
+      "key": "subcat_003",
+      "zh": "不开心",
+      "en": "Unhappy"
+    },
+    "乐器": {
+      "key": "subcat_004",
+      "zh": "乐器",
+      "en": "Musical Instruments"
+    },
+    "云": {
+      "key": "subcat_005",
+      "zh": "云",
+      "en": "Clouds"
+    },
+    "人物构图": {
+      "key": "subcat_006",
+      "zh": "人物构图",
+      "en": "Character Framing"
+    },
+    "人物视觉朝向": {
+      "key": "subcat_007",
+      "zh": "人物视觉朝向",
+      "en": "Character Gaze Direction"
+    },
+    "光照": {
+      "key": "subcat_008",
+      "zh": "光照",
+      "en": "Lighting"
+    },
+    "其他动作": {
+      "key": "subcat_009",
+      "zh": "其他动作",
+      "en": "Other Actions"
+    },
+    "其他沟通": {
+      "key": "subcat_010",
+      "zh": "其他沟通",
+      "en": "Other Framing"
+    },
+    "其他物品": {
+      "key": "subcat_011",
+      "zh": "其他物品",
+      "en": "Other Items"
+    },
+    "其他表情": {
+      "key": "subcat_012",
+      "zh": "其他表情",
+      "en": "Other Expressions"
+    },
+    "其他装饰物": {
+      "key": "subcat_013",
+      "zh": "其他装饰物",
+      "en": "Other Accessories"
+    },
+    "动物": {
+      "key": "subcat_014",
+      "zh": "动物",
+      "en": "Animals"
+    },
+    "哭": {
+      "key": "subcat_015",
+      "zh": "哭",
+      "en": "Crying"
+    },
+    "嘴巴": {
+      "key": "subcat_016",
+      "zh": "嘴巴",
+      "en": "Mouth"
+    },
+    "围巾": {
+      "key": "subcat_017",
+      "zh": "围巾",
+      "en": "Scarves"
+    },
+    "城市": {
+      "key": "subcat_018",
+      "zh": "城市",
+      "en": "City"
+    },
+    "基础动作": {
+      "key": "subcat_019",
+      "zh": "基础动作",
+      "en": "Basic Actions"
+    },
+    "大自然": {
+      "key": "subcat_020",
+      "zh": "大自然",
+      "en": "Nature"
+    },
+    "天气": {
+      "key": "subcat_021",
+      "zh": "天气",
+      "en": "Weather"
+    },
+    "天空": {
+      "key": "subcat_022",
+      "zh": "天空",
+      "en": "Sky"
+    },
+    "头发发型": {
+      "key": "subcat_023",
+      "zh": "头发发型",
+      "en": "Hairstyles"
+    },
+    "头部装饰物": {
+      "key": "subcat_024",
+      "zh": "头部装饰物",
+      "en": "Head Accessories"
+    },
+    "季节": {
+      "key": "subcat_025",
+      "zh": "季节",
+      "en": "Seasons"
+    },
+    "学习用品": {
+      "key": "subcat_026",
+      "zh": "学习用品",
+      "en": "School Supplies"
+    },
+    "室内": {
+      "key": "subcat_027",
+      "zh": "室内",
+      "en": "Indoors"
+    },
+    "室外": {
+      "key": "subcat_028",
+      "zh": "室外",
+      "en": "Outdoors"
+    },
+    "对象": {
+      "key": "subcat_029",
+      "zh": "对象",
+      "en": "Subject"
+    },
+    "年龄": {
+      "key": "subcat_030",
+      "zh": "年龄",
+      "en": "Age"
+    },
+    "性器官": {
+      "key": "subcat_031",
+      "zh": "性器官",
+      "en": "Genitals"
+    },
+    "性爱动作": {
+      "key": "subcat_032",
+      "zh": "性爱动作",
+      "en": "Sexual Actions"
+    },
+    "成人玩具": {
+      "key": "subcat_033",
+      "zh": "成人玩具",
+      "en": "Adult Toys"
+    },
+    "手抓着某物": {
+      "key": "subcat_034",
+      "zh": "手抓着某物",
+      "en": "Grabbing Something"
+    },
+    "手放在某地": {
+      "key": "subcat_035",
+      "zh": "手放在某地",
+      "en": "Hand Placement"
+    },
+    "手部动作": {
+      "key": "subcat_036",
+      "zh": "手部动作",
+      "en": "Hand Gestures"
+    },
+    "手部拿着某物": {
+      "key": "subcat_037",
+      "zh": "手部拿着某物",
+      "en": "Holding Something"
+    },
+    "手部装饰物": {
+      "key": "subcat_038",
+      "zh": "手部装饰物",
+      "en": "Hand Accessories"
+    },
+    "指甲": {
+      "key": "subcat_039",
+      "zh": "指甲",
+      "en": "Nails"
+    },
+    "效果": {
+      "key": "subcat_040",
+      "zh": "效果",
+      "en": "Effects"
+    },
+    "数码设备": {
+      "key": "subcat_041",
+      "zh": "数码设备",
+      "en": "Digital Devices"
+    },
+    "植物": {
+      "key": "subcat_042",
+      "zh": "植物",
+      "en": "Plants"
+    },
+    "正装": {
+      "key": "subcat_043",
+      "zh": "正装",
+      "en": "Formal Wear"
+    },
+    "武器": {
+      "key": "subcat_044",
+      "zh": "武器",
+      "en": "Weapons"
+    },
+    "氛围": {
+      "key": "subcat_045",
+      "zh": "氛围",
+      "en": "Atmosphere"
+    },
+    "水": {
+      "key": "subcat_046",
+      "zh": "水",
+      "en": "Water"
+    },
+    "牙齿": {
+      "key": "subcat_047",
+      "zh": "牙齿",
+      "en": "Teeth"
+    },
+    "特写镜头": {
+      "key": "subcat_048",
+      "zh": "特写镜头",
+      "en": "Close-up Shot"
+    },
+    "生气": {
+      "key": "subcat_049",
+      "zh": "生气",
+      "en": "Angry"
+    },
+    "画笔": {
+      "key": "subcat_050",
+      "zh": "画笔",
+      "en": "Brushwork"
+    },
+    "画面量质": {
+      "key": "subcat_051",
+      "zh": "画面量质",
+      "en": "Image Quality"
+    },
+    "皮肤": {
+      "key": "subcat_052",
+      "zh": "皮肤",
+      "en": "Skin"
+    },
+    "眉毛": {
+      "key": "subcat_053",
+      "zh": "眉毛",
+      "en": "Eyebrows"
+    },
+    "眼睛": {
+      "key": "subcat_054",
+      "zh": "眼睛",
+      "en": "Eyes"
+    },
+    "瞳孔": {
+      "key": "subcat_055",
+      "zh": "瞳孔",
+      "en": "Pupils"
+    },
+    "笑": {
+      "key": "subcat_056",
+      "zh": "笑",
+      "en": "Smiling"
+    },
+    "翅膀": {
+      "key": "subcat_057",
+      "zh": "翅膀",
+      "en": "Wings"
+    },
+    "肩部": {
+      "key": "subcat_058",
+      "zh": "肩部",
+      "en": "Shoulders"
+    },
+    "背景": {
+      "key": "subcat_059",
+      "zh": "背景",
+      "en": "Background"
+    },
+    "胸部": {
+      "key": "subcat_060",
+      "zh": "胸部",
+      "en": "Chest"
+    },
+    "脸型": {
+      "key": "subcat_061",
+      "zh": "脸型",
+      "en": "Face Shape"
+    },
+    "脸部装饰物": {
+      "key": "subcat_062",
+      "zh": "脸部装饰物",
+      "en": "Face Accessories"
+    },
+    "腰部": {
+      "key": "subcat_063",
+      "zh": "腰部",
+      "en": "Waist"
+    },
+    "腹部": {
+      "key": "subcat_064",
+      "zh": "腹部",
+      "en": "Abdomen"
+    },
+    "腿部": {
+      "key": "subcat_065",
+      "zh": "腿部",
+      "en": "Legs"
+    },
+    "腿部动作": {
+      "key": "subcat_066",
+      "zh": "腿部动作",
+      "en": "Leg Actions"
+    },
+    "腿部装饰物": {
+      "key": "subcat_067",
+      "zh": "腿部装饰物",
+      "en": "Leg Accessories"
+    },
+    "舌头": {
+      "key": "subcat_068",
+      "zh": "舌头",
+      "en": "Tongue"
+    },
+    "艺术家风格": {
+      "key": "subcat_069",
+      "zh": "艺术家风格",
+      "en": "Artist Style"
+    },
+    "艺术派系": {
+      "key": "subcat_070",
+      "zh": "艺术派系",
+      "en": "Art Genre"
+    },
+    "艺术类型": {
+      "key": "subcat_071",
+      "zh": "艺术类型",
+      "en": "Artwork Type"
+    },
+    "艺术风格": {
+      "key": "subcat_072",
+      "zh": "艺术风格",
+      "en": "Art Style"
+    },
+    "蔑视": {
+      "key": "subcat_073",
+      "zh": "蔑视",
+      "en": "Disdain"
+    },
+    "衣服套装": {
+      "key": "subcat_074",
+      "zh": "衣服套装",
+      "en": "Clothing Sets"
+    },
+    "衣服花纹": {
+      "key": "subcat_075",
+      "zh": "衣服花纹",
+      "en": "Clothing Patterns"
+    },
+    "衣服装饰": {
+      "key": "subcat_076",
+      "zh": "衣服装饰",
+      "en": "Clothing Decorations"
+    },
+    "衣服风格": {
+      "key": "subcat_077",
+      "zh": "衣服风格",
+      "en": "Clothing Styles"
+    },
+    "袜子": {
+      "key": "subcat_078",
+      "zh": "袜子",
+      "en": "Socks"
+    },
+    "裙子": {
+      "key": "subcat_079",
+      "zh": "裙子",
+      "en": "Skirts"
+    },
+    "裤子": {
+      "key": "subcat_080",
+      "zh": "裤子",
+      "en": "Pants"
+    },
+    "设定": {
+      "key": "subcat_081",
+      "zh": "设定",
+      "en": "Lore"
+    },
+    "身份（职业）": {
+      "key": "subcat_082",
+      "zh": "身份（职业）",
+      "en": "Identity / Occupation"
+    },
+    "身材": {
+      "key": "subcat_083",
+      "zh": "身材",
+      "en": "Body Type"
+    },
+    "镜头角度": {
+      "key": "subcat_084",
+      "zh": "镜头角度",
+      "en": "Camera Angle"
+    },
+    "面部": {
+      "key": "subcat_085",
+      "zh": "面部",
+      "en": "Face"
+    },
+    "鞋子": {
+      "key": "subcat_086",
+      "zh": "鞋子",
+      "en": "Shoes"
+    },
+    "颜文字": {
+      "key": "subcat_087",
+      "zh": "颜文字",
+      "en": "Emoticons"
+    },
+    "颜色": {
+      "key": "subcat_088",
+      "zh": "颜色",
+      "en": "Colors"
+    },
+    "食物": {
+      "key": "subcat_089",
+      "zh": "食物",
+      "en": "Food"
+    },
+    "餐具": {
+      "key": "subcat_090",
+      "zh": "餐具",
+      "en": "Utensils"
+    },
+    "鼻子": {
+      "key": "subcat_091",
+      "zh": "鼻子",
+      "en": "Nose"
+    },
+    "NEW_TODO": {
+      "key": "subcat_new_todo",
+      "zh": "NEW_TODO",
+      "en": "NEW_TODO"
+    },
+    "二次元角色": {
+      "key": "subcat_093",
+      "zh": "二次元角色",
+      "en": "Anime Character"
+    },
+    "艺术家": {
+      "key": "subcat_094",
+      "zh": "艺术家",
+      "en": "Artist"
+    },
+    "质量词": {
+      "key": "subcat_095",
+      "zh": "质量词",
+      "en": "Quality Tags"
+    }
+  }
+}
