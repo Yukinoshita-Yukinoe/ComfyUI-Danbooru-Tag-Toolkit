@@ -9,6 +9,28 @@ Danbooru tag workflow tools for ComfyUI.
 - Flexible category mapping and output order from Excel/CSV database
 - Works with both direct input tags and linked upstream prompt sources
 
+## Gallery Source Note
+
+`Danbooru Tag Toolkit - Danbooru Gallery Lite` keeps its existing node name for workflow compatibility, but the gallery runtime now includes a Gelbooru-backed fallback path.
+
+Why this exists:
+
+- Some environments now hit `403 Forbidden` when loading Danbooru gallery data or browser-side preview images.
+- Gelbooru's anonymous DAPI can also be unavailable, so the fallback uses public HTML endpoints instead of relying on the DAPI path.
+
+Current behavior:
+
+- Gallery list loading can fall back to Gelbooru public pages.
+- Preview thumbnails are proxied through the local ComfyUI server to avoid direct browser hotlink failures.
+- Per-post category sections (`artist`, `copyright`, `character`, `general`, `meta`) are hydrated from Gelbooru post detail pages when needed.
+- The first hover on a not-yet-hydrated post may be slightly slower than native Danbooru JSON mode because categories are fetched from the detail page on demand.
+- A small background warmup is used after loading posts to reduce that first-hover delay for the first visible items.
+
+Notes:
+
+- The node display name is unchanged to avoid breaking existing workflows.
+- Gelbooru tag strings from detail pages are URL-decoded before display, so encoded values like `%28...%29` render as normal parentheses.
+
 ## Screenshots
 
 ### All-in-One + Gallery Workflow

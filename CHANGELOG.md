@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.2 - 2026-05-26
+
+### Added
+- Added a Gelbooru-backed fallback path for `Danbooru Gallery Lite` when Danbooru gallery requests are not usable in the current environment.
+- Added a local gallery image proxy route so preview thumbnails no longer depend on direct browser hotlink access.
+- Added per-post detail hydration and cache for gallery category sections (`artist`, `copyright`, `character`, `general`, `meta`).
+- Added a small background warmup step after gallery load to reduce first-hover tooltip delay for the first visible posts.
+
+### Fixed
+- Fixed gallery tooltip categorization when using the Gelbooru fallback path by loading structured tag sections from post detail pages instead of showing everything as `general`.
+- Fixed selected gallery image loading by resolving higher-quality detail/sample/original image URLs from Gelbooru post pages when available.
+- Fixed URL-encoded Gelbooru tag text in category sections so values like `%28...%29` display as normal parentheses.
+- Fixed rating filter mapping for fallback gallery mode so ComfyUI `safe/questionable` selections align with Gelbooru `general/sensitive` values.
+
 ## 1.0.1 - 2026-03-18
 
 ### Added
