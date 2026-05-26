@@ -8,6 +8,7 @@ import pickle
 import re
 import io
 import time
+import html
 import urllib.parse
 import urllib.request
 import torch
@@ -28,8 +29,18 @@ _latest_tag_bundle_by_node: Dict[str, Dict[str, Any]] = {}
 _gallery_post_cache: Dict[str, Dict[str, Any]] = {}
 _gallery_image_cache: Dict[str, Dict[str, Any]] = {}
 _gallery_autocomplete_cache: Dict[str, Dict[str, Any]] = {}
+_gallery_post_detail_cache: Dict[str, Dict[str, Any]] = {}
 
 _DANBOORU_BASE_URL = "https://danbooru.donmai.us"
+_DANBOORU_HTTP_HEADERS = {
+    "User-Agent": "ComfyUI-Danbooru-Tag-Toolkit/1.0.1",
+    "Referer": _DANBOORU_BASE_URL + "/",
+}
+_GELBOORU_BASE_URL = "https://gelbooru.com"
+_GELBOORU_HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Referer": _GELBOORU_BASE_URL + "/",
+}
 _GALLERY_POST_CACHE_TTL = 120
 _GALLERY_POST_CACHE_LIMIT = 128
 _GALLERY_IMAGE_CACHE_TTL = 180
@@ -38,6 +49,8 @@ _GALLERY_IMAGE_CACHE_LIMIT = 24
 _GALLERY_OUTPUT_SELECTION_LIMIT = 0
 _GALLERY_AUTOCOMPLETE_CACHE_TTL = 300
 _GALLERY_AUTOCOMPLETE_CACHE_LIMIT = 256
+_GALLERY_POST_DETAIL_CACHE_TTL = 900
+_GALLERY_POST_DETAIL_CACHE_LIMIT = 256
 SEPARATOR_OPTIONS = ["comma", "newline", "space", True, False, "True", "False", "true", "false"]
 _SORTER_PRESET_DIR_NAME = "sorter_presets"
 _TAG_DATABASE_CACHE_DIR_NAME = ".tag_db_cache"
@@ -1532,6 +1545,42 @@ def _absolutize_danbooru_url(raw_url: Any) -> str:
     return text
 
 
+def _absolutize_gelbooru_url(raw_url: Any) -> str:
+    text = str(raw_url or "").strip()
+    if not text:
+        return ""
+    if text.startswith("//"):
+        return "https:" + text
+    if text.startswith("/"):
+        return _GELBOORU_BASE_URL + text
+    return text
+
+
+def _is_allowed_gallery_remote_url(raw_url: Any) -> bool:
+    final_url = _absolutize_gelbooru_url(raw_url)
+    if not final_url:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(final_url)
+    except Exception:
+        return False
+    scheme = str(parsed.scheme or "").lower()
+    host = str(parsed.netloc or "").lower().split(":", 1)[0]
+    if scheme not in {"http", "https"} or not host:
+        return False
+    return (
+        host == "gelbooru.com"
+        or host.endswith(".gelbooru.com")
+        or host == "img2.gelbooru.com"
+        or host.endswith(".img2.gelbooru.com")
+    )
+
+
+def _open_danbooru_url(url: str, timeout: int = 15):
+    request = urllib.request.Request(_absolutize_gelbooru_url(url), headers=_GELBOORU_HTTP_HEADERS)
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
 def _tag_string_to_prompt(tag_string: Any) -> str:
     tokens = [t.strip() for t in str(tag_string or "").split(" ") if t.strip()]
     if not tokens:
@@ -1549,6 +1598,149 @@ def _guess_file_ext_from_url(url: Any) -> str:
         return ext.lower().lstrip(".")
     except Exception:
         return ""
+
+
+def _fetch_text_with_gallery_headers(url: str, timeout: int = 15) -> str:
+    with _open_danbooru_url(url, timeout=timeout) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def _normalize_gelbooru_rating_filter(rating_value: str) -> str:
+    text = str(rating_value or "").strip().lower()
+    if text == "safe":
+        return "general"
+    if text == "questionable":
+        return "sensitive"
+    return text
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _parse_gelbooru_title_metadata(title_text: str) -> Dict[str, Any]:
+    raw_title = html.unescape(str(title_text or "").strip())
+    if not raw_title:
+        return {
+            "tag_string": "",
+            "prompt": "",
+            "score": 0,
+            "rating": "",
+        }
+
+    parts = [p.strip() for p in raw_title.split(" ") if p.strip()]
+    score = 0
+    rating = ""
+    tags: List[str] = []
+    for part in parts:
+        if part.startswith("score:"):
+            try:
+                score = int(part.split(":", 1)[1].strip() or 0)
+            except Exception:
+                score = 0
+            continue
+        if part.startswith("rating:"):
+            rating = part.split(":", 1)[1].strip().lower()
+            continue
+        tags.append(part)
+
+    tag_string = " ".join(tags).strip()
+    return {
+        "tag_string": tag_string,
+        "prompt": _tag_string_to_prompt(tag_string),
+        "score": score,
+        "rating": rating,
+    }
+
+
+def _get_gelbooru_post_detail(post_id: str) -> Dict[str, Any]:
+    post_key = str(post_id or "").strip()
+    if not post_key:
+        return {}
+
+    _cleanup_expired_cache_items(_gallery_post_detail_cache, _GALLERY_POST_DETAIL_CACHE_TTL)
+    cached = _gallery_post_detail_cache.get(post_key)
+    if isinstance(cached, dict) and isinstance(cached.get("data"), dict):
+        cached["ts"] = time.time()
+        return cached["data"]
+
+    params = urllib.parse.urlencode({
+        "page": "post",
+        "s": "view",
+        "id": post_key,
+    })
+    view_url = f"{_GELBOORU_BASE_URL}/index.php?{params}"
+    page_html = _fetch_text_with_gallery_headers(view_url, timeout=20)
+
+    original_match = re.search(r'href="([^"]+)"[^>]*>Original image</a>', page_html, re.I | re.S)
+    sample_match = re.search(r'id="image"[^>]+src="([^"]+)"', page_html, re.I | re.S)
+    og_match = re.search(r'<meta property="og:image" content="([^"]+)"', page_html, re.I | re.S)
+    tag_matches = re.findall(
+        r'<li class="tag-type-([a-z]+)"[^>]*>.*?<a href="index\.php\?page=post&amp;s=list&amp;tags=([^"]+)">',
+        page_html,
+        re.I | re.S,
+    )
+
+    categorized_tags: Dict[str, List[str]] = {
+        "artist": [],
+        "copyright": [],
+        "character": [],
+        "general": [],
+        "meta": [],
+    }
+    category_map = {
+        "artist": "artist",
+        "copyright": "copyright",
+        "character": "character",
+        "metadata": "meta",
+        "general": "general",
+    }
+    for raw_category, raw_tag in tag_matches:
+        category_key = category_map.get(str(raw_category or "").strip().lower())
+        if not category_key:
+            continue
+        tag_value = urllib.parse.unquote(str(raw_tag or "").strip()).replace(" ", "_")
+        if not tag_value or tag_value in categorized_tags[category_key]:
+            continue
+        categorized_tags[category_key].append(tag_value)
+
+    merged_tag_string = " ".join(
+        tag
+        for key in ("artist", "copyright", "character", "general", "meta")
+        for tag in categorized_tags[key]
+    ).strip()
+
+    detail = {
+        "view_url": view_url,
+        "image_url": _absolutize_gelbooru_url(html.unescape(original_match.group(1))) if original_match else "",
+        "display_url": _absolutize_gelbooru_url(html.unescape(sample_match.group(1))) if sample_match else "",
+        "preview_url": _absolutize_gelbooru_url(html.unescape(og_match.group(1))) if og_match else "",
+        "tag_string_artist": " ".join(categorized_tags["artist"]).strip(),
+        "tag_string_copyright": " ".join(categorized_tags["copyright"]).strip(),
+        "tag_string_character": " ".join(categorized_tags["character"]).strip(),
+        "tag_string_general": " ".join(categorized_tags["general"]).strip(),
+        "tag_string_meta": " ".join(categorized_tags["meta"]).strip(),
+        "tag_string": merged_tag_string,
+        "detail_loaded": True,
+    }
+
+    if not detail["display_url"]:
+        detail["display_url"] = detail["preview_url"] or detail["image_url"]
+    if not detail["image_url"]:
+        detail["image_url"] = detail["display_url"] or detail["preview_url"]
+    if not detail["preview_url"]:
+        detail["preview_url"] = detail["display_url"] or detail["image_url"]
+
+    _cleanup_expired_cache_items(_gallery_post_detail_cache, _GALLERY_POST_DETAIL_CACHE_TTL)
+    _evict_oldest_cache_item(_gallery_post_detail_cache, _GALLERY_POST_DETAIL_CACHE_LIMIT)
+    _gallery_post_detail_cache[post_key] = {
+        "ts": time.time(),
+        "data": detail,
+    }
+    return detail
 
 
 def _evict_oldest_cache_item(cache_dict: Dict[str, Any], max_items: int):
@@ -1575,11 +1767,8 @@ def _cleanup_expired_cache_items(cache_dict: Dict[str, Any], ttl_seconds: int):
 
 def _fetch_gallery_posts(tags: str, limit: int, page: int, rating: str = "safe") -> List[Dict[str, Any]]:
     allowed_image_ext = {"jpg", "jpeg", "png", "webp", "bmp", "tiff", "tif"}
-    rating_value = str(rating or "all").strip().lower()
-    tag_parts = [str(tags or "").strip()]
-    if rating_value and rating_value != "all":
-        tag_parts.append(f"rating:{rating_value}")
-    final_tags = " ".join([p for p in tag_parts if p]).strip()
+    rating_value = _normalize_gelbooru_rating_filter(rating)
+    final_tags = str(tags or "").strip()
 
     cache_key = f"{final_tags}|{limit}|{page}"
     now = time.time()
@@ -1587,41 +1776,39 @@ def _fetch_gallery_posts(tags: str, limit: int, page: int, rating: str = "safe")
     if cached and (now - cached.get("ts", 0) <= _GALLERY_POST_CACHE_TTL):
         return cached.get("posts", [])
 
+    offset = max(0, (int(page) - 1) * 42)
     query = urllib.parse.urlencode({
+        "page": "post",
+        "s": "list",
         "tags": final_tags,
-        "limit": int(limit),
-        "page": int(page),
+        "pid": offset,
     })
-    api_url = f"{_DANBOORU_BASE_URL}/posts.json?{query}"
-
-    with urllib.request.urlopen(api_url, timeout=15) as response:
-        payload = response.read().decode("utf-8", errors="replace")
-    parsed = json.loads(payload)
-    if not isinstance(parsed, list):
-        return []
+    list_url = f"{_GELBOORU_BASE_URL}/index.php?{query}"
+    page_html = _fetch_text_with_gallery_headers(list_url, timeout=20)
 
     posts: List[Dict[str, Any]] = []
-    for item in parsed:
-        if not isinstance(item, dict):
+    post_matches = re.findall(
+        r'<a id="p(\d+)" href="([^"]*page=post&amp;s=view&amp;id=\d+[^"]*)">\s*<img src="([^"]+)" title="([^"]*)"\s+alt="([^"]*)"',
+        page_html,
+        re.I | re.S,
+    )
+    for post_id, raw_href, raw_thumb, raw_title, _raw_alt in post_matches:
+        if len(posts) >= int(limit):
+            break
+
+        meta = _parse_gelbooru_title_metadata(raw_title)
+        if rating_value and rating_value != "all" and meta["rating"] != rating_value:
             continue
 
-        post_id = item.get("id")
-        tag_string = str(item.get("tag_string", "") or "")
-        prompt = _tag_string_to_prompt(tag_string)
-
-        preview_url = _absolutize_danbooru_url(item.get("preview_file_url"))
+        preview_url = _absolutize_gelbooru_url(raw_thumb)
         if not preview_url:
             continue
 
-        image_url = _absolutize_danbooru_url(item.get("file_url"))
-        if not image_url:
-            image_url = _absolutize_danbooru_url(item.get("large_file_url"))
-        if not image_url:
-            image_url = preview_url
-
-        file_ext = str(item.get("file_ext", "") or "").strip().lower()
+        display_url = preview_url
+        image_url = preview_url
+        file_ext = _guess_file_ext_from_url(preview_url)
         if not file_ext:
-            file_ext = _guess_file_ext_from_url(image_url)
+            file_ext = _guess_file_ext_from_url(preview_url)
         if file_ext and file_ext not in allowed_image_ext:
             continue
 
@@ -1629,26 +1816,24 @@ def _fetch_gallery_posts(tags: str, limit: int, page: int, rating: str = "safe")
             "id": post_id,
             "preview_url": preview_url,
             "image_url": image_url,
-            "display_url": (
-                _absolutize_danbooru_url(item.get("large_file_url"))
-                or _absolutize_danbooru_url(item.get("file_url"))
-                or preview_url
-            ),
-            "preview_width": int(item.get("preview_width", 0) or 0),
-            "preview_height": int(item.get("preview_height", 0) or 0),
-            "image_width": int(item.get("image_width", 0) or 0),
-            "image_height": int(item.get("image_height", 0) or 0),
-            "tag_string": tag_string,
-            "prompt": prompt,
-            "score": item.get("score", 0),
-            "rating": item.get("rating", ""),
+            "display_url": display_url,
+            "preview_width": 0,
+            "preview_height": 0,
+            "image_width": 0,
+            "image_height": 0,
+            "tag_string": meta["tag_string"],
+            "prompt": meta["prompt"],
+            "score": meta["score"],
+            "rating": meta["rating"],
             "file_ext": file_ext,
-            "md5": item.get("md5", ""),
-            "tag_string_artist": str(item.get("tag_string_artist", "") or ""),
-            "tag_string_copyright": str(item.get("tag_string_copyright", "") or ""),
-            "tag_string_character": str(item.get("tag_string_character", "") or ""),
-            "tag_string_general": str(item.get("tag_string_general", "") or ""),
-            "tag_string_meta": str(item.get("tag_string_meta", "") or ""),
+            "md5": "",
+            "tag_string_artist": "",
+            "tag_string_copyright": "",
+            "tag_string_character": "",
+            "tag_string_general": meta["tag_string"],
+            "tag_string_meta": "",
+            "view_url": _absolutize_gelbooru_url(html.unescape(raw_href)),
+            "detail_loaded": False,
         })
 
     _evict_oldest_cache_item(_gallery_post_cache, _GALLERY_POST_CACHE_LIMIT)
@@ -1672,14 +1857,12 @@ def _fetch_gallery_autocomplete(query: str, limit: int = 20) -> List[Dict[str, A
         return cached.get("items", [])
 
     params = urllib.parse.urlencode({
-        "search[name_matches]": f"{text}*",
-        "search[order]": "count",
-        "limit": limit,
+        "page": "autocomplete2",
+        "type": "tag_query",
+        "term": text,
     })
-    api_url = f"{_DANBOORU_BASE_URL}/tags.json?{params}"
-
-    with urllib.request.urlopen(api_url, timeout=10) as response:
-        payload = response.read().decode("utf-8", errors="replace")
+    api_url = f"{_GELBOORU_BASE_URL}/index.php?{params}"
+    payload = _fetch_text_with_gallery_headers(api_url, timeout=10)
     parsed = json.loads(payload)
     if not isinstance(parsed, list):
         return []
@@ -1688,14 +1871,16 @@ def _fetch_gallery_autocomplete(query: str, limit: int = 20) -> List[Dict[str, A
     for tag in parsed:
         if not isinstance(tag, dict):
             continue
-        name = str(tag.get("name", "") or "").strip()
+        name = str(tag.get("label", "") or tag.get("value", "") or "").strip().replace(" ", "_")
         if not name:
             continue
         items.append({
             "name": name,
-            "post_count": int(tag.get("post_count", 0) or 0),
-            "category": int(tag.get("category", -1) or -1),
+            "post_count": _safe_int(tag.get("post_count", 0), 0),
+            "category": _safe_int(tag.get("category", -1), -1),
         })
+        if len(items) >= limit:
+            break
 
     _evict_oldest_cache_item(_gallery_autocomplete_cache, _GALLERY_AUTOCOMPLETE_CACHE_LIMIT)
     _gallery_autocomplete_cache[cache_key] = {
@@ -1706,7 +1891,7 @@ def _fetch_gallery_autocomplete(query: str, limit: int = 20) -> List[Dict[str, A
 
 
 def _load_gallery_image_tensor(image_url: str) -> torch.Tensor:
-    final_url = _absolutize_danbooru_url(image_url)
+    final_url = _absolutize_gelbooru_url(image_url)
     if not final_url:
         return _empty_image_tensor()
 
@@ -1718,7 +1903,7 @@ def _load_gallery_image_tensor(image_url: str) -> torch.Tensor:
             cached["ts"] = time.time()
             return tensor
 
-    with urllib.request.urlopen(final_url, timeout=20) as response:
+    with _open_danbooru_url(final_url, timeout=20) as response:
         image_bytes = response.read()
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     image_arr = np.array(image).astype(np.float32) / 255.0
@@ -1734,7 +1919,7 @@ def _load_gallery_image_tensor(image_url: str) -> torch.Tensor:
 
 
 def _get_cached_gallery_image_tensor(image_url: str) -> torch.Tensor:
-    final_url = _absolutize_danbooru_url(image_url)
+    final_url = _absolutize_gelbooru_url(image_url)
     if not final_url:
         return _empty_image_tensor()
 
@@ -2298,18 +2483,47 @@ class DanbooruTagGalleryLiteNode:
             if not prompt:
                 prompt = _tag_string_to_prompt(item.get("tag_string", ""))
 
+            post_id = str(item.get("post_id", "") or "").strip()
             candidates: List[str] = []
+            if post_id:
+                try:
+                    detail = _get_gelbooru_post_detail(post_id)
+                    if str(detail.get("tag_string", "") or "").strip():
+                        item["tag_string"] = detail.get("tag_string", item.get("tag_string", ""))
+                    for key in (
+                        "tag_string_artist",
+                        "tag_string_copyright",
+                        "tag_string_character",
+                        "tag_string_general",
+                        "tag_string_meta",
+                    ):
+                        if str(detail.get(key, "") or "").strip():
+                            item[key] = detail.get(key, item.get(key, ""))
+                    for key in ("image_url", "display_url", "preview_url"):
+                        value = str(detail.get(key, "") or "").strip()
+                        if value:
+                            candidates.append(value)
+                except Exception:
+                    pass
             image_url = str(item.get("image_url", "") or "").strip()
             preview_url = str(item.get("preview_url", "") or "").strip()
             if image_url:
                 candidates.append(image_url)
             if preview_url:
                 candidates.append(preview_url)
-            if not candidates:
+            deduped_candidates: List[str] = []
+            seen_candidates = set()
+            for candidate in candidates:
+                normalized = _absolutize_gelbooru_url(candidate)
+                if not normalized or normalized in seen_candidates:
+                    continue
+                seen_candidates.add(normalized)
+                deduped_candidates.append(normalized)
+            if not deduped_candidates:
                 continue
 
             loaded_tensor = None
-            for url in candidates:
+            for url in deduped_candidates:
                 try:
                     loaded_tensor = _get_cached_gallery_image_tensor(url)
                     break
@@ -2317,7 +2531,7 @@ class DanbooruTagGalleryLiteNode:
                     loaded_tensor = None
 
             if loaded_tensor is None:
-                print(f"[DanbooruTagToolkit] Gallery item skipped (all image urls failed): {candidates}")
+                print(f"[DanbooruTagToolkit] Gallery item skipped (all image urls failed): {deduped_candidates}")
                 continue
 
             images.append(loaded_tensor)
@@ -2614,6 +2828,56 @@ if PromptServer is not None and web is not None:
                     "count": 0,
                 }, status=500)
 
+        @PromptServer.instance.routes.get("/danbooru_tag_gallery/image")
+        async def proxy_gallery_image(request):
+            raw_url = str(request.query.get("url", "")).strip()
+            final_url = _absolutize_danbooru_url(raw_url)
+            if not _is_allowed_gallery_remote_url(final_url):
+                return web.json_response({
+                    "status": "error",
+                    "message": "Invalid gallery image url",
+                }, status=400)
+
+            try:
+                with _open_danbooru_url(final_url, timeout=20) as response:
+                    image_bytes = response.read()
+                    content_type = str(response.headers.get("Content-Type", "application/octet-stream"))
+                return web.Response(
+                    body=image_bytes,
+                    content_type=content_type.split(";", 1)[0].strip() or "application/octet-stream",
+                    headers={
+                        "Cache-Control": "public, max-age=300",
+                    },
+                )
+            except Exception as e:
+                return web.json_response({
+                    "status": "error",
+                    "message": str(e),
+                }, status=502)
+
+        @PromptServer.instance.routes.get("/danbooru_tag_gallery/post_detail")
+        async def get_gallery_post_detail(request):
+            post_id = str(request.query.get("post_id", "")).strip()
+            if not post_id:
+                return web.json_response({
+                    "status": "error",
+                    "message": "Missing post_id",
+                }, status=400)
+
+            try:
+                detail = _get_gelbooru_post_detail(post_id)
+                return web.json_response({
+                    "status": "success",
+                    "post_id": post_id,
+                    "detail": detail,
+                })
+            except Exception as e:
+                return web.json_response({
+                    "status": "error",
+                    "message": str(e),
+                    "detail": {},
+                }, status=502)
+
         @PromptServer.instance.routes.get("/danbooru_tag_gallery/cache/stats")
         async def get_gallery_cache_stats(request):
             _cleanup_expired_cache_items(_gallery_image_cache, _GALLERY_IMAGE_CACHE_TTL)
@@ -2633,6 +2897,7 @@ if PromptServer is not None and web is not None:
             _gallery_post_cache.clear()
             _gallery_image_cache.clear()
             _gallery_autocomplete_cache.clear()
+            _gallery_post_detail_cache.clear()
             return web.json_response({
                 "status": "success",
                 "message": "Gallery cache cleared.",
@@ -2640,6 +2905,7 @@ if PromptServer is not None and web is not None:
                     "post_cache": 0,
                     "image_cache": 0,
                     "autocomplete_cache": 0,
+                    "detail_cache": 0,
                 },
             })
     except Exception as e:
