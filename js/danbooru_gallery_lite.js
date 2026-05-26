@@ -720,21 +720,29 @@ function ensureTooltip(state) {
     return tooltip;
 }
 
-function positionTooltip(tooltip, event) {
-    if (!tooltip || !event) return;
+function updateHoverPointer(state, event) {
+    if (!state || !event) return;
+    state.hoverPointer = {
+        x: Number(event.clientX || 0),
+        y: Number(event.clientY || 0),
+    };
+}
+
+function positionTooltip(tooltip, pointer) {
+    if (!tooltip || !pointer) return;
     const buffer = 16;
     tooltip.style.left = "0px";
     tooltip.style.top = "0px";
     tooltip.style.display = "block";
 
     const rect = tooltip.getBoundingClientRect();
-    let left = event.clientX + buffer;
-    let top = event.clientY + buffer;
+    let left = Number(pointer.x || 0) + buffer;
+    let top = Number(pointer.y || 0) + buffer;
     if (left + rect.width > window.innerWidth - 8) {
-        left = Math.max(8, event.clientX - rect.width - buffer);
+        left = Math.max(8, Number(pointer.x || 0) - rect.width - buffer);
     }
     if (top + rect.height > window.innerHeight - 8) {
-        top = Math.max(8, event.clientY - rect.height - buffer);
+        top = Math.max(8, Number(pointer.y || 0) - rect.height - buffer);
     }
 
     tooltip.style.left = `${left}px`;
@@ -788,18 +796,32 @@ function hideTooltip(state) {
         state.tooltipEl.style.display = "none";
     }
     state.hoveredPostId = "";
+    state.hoverRequestId = Number(state.hoverRequestId || 0) + 1;
 }
 
 function moveTooltip(state, event) {
+    updateHoverPointer(state, event);
     if (!state?.tooltipEl || state.tooltipEl.style.display === "none") return;
-    positionTooltip(state.tooltipEl, event);
+    positionTooltip(state.tooltipEl, state.hoverPointer);
 }
 
 async function showTooltip(state, post, event) {
+    updateHoverPointer(state, event);
+    const postId = String(post?.id || "");
+    const requestId = Number(state.hoverRequestId || 0) + 1;
+    state.hoverRequestId = requestId;
+    state.hoveredPostId = postId;
+
+    // Render immediately with whatever data we already have so hover feels instant.
+    const initialTooltip = renderTooltipContent(state, post);
+    positionTooltip(initialTooltip, state.hoverPointer);
+
     const hydratedPost = await ensurePostDetailCategories(state, post);
+    if (Number(state.hoverRequestId || 0) !== requestId) return;
+    if (String(state.hoveredPostId || "") !== postId) return;
+
     const tooltip = renderTooltipContent(state, hydratedPost);
-    state.hoveredPostId = String(post?.id || "");
-    positionTooltip(tooltip, event);
+    positionTooltip(tooltip, state.hoverPointer);
 }
 
 function syncSelectionWidget(node, selectionWidget, selectedMap) {
@@ -1033,6 +1055,8 @@ app.registerExtension({
                 tooltipEl: null,
                 hoveredPostId: "",
                 detailLoadMap: new Map(),
+                hoverRequestId: 0,
+                hoverPointer: null,
             };
             state.getSelectedCategories = getSelectedCategories;
             this.__dtgState = state;
