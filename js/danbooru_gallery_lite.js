@@ -545,6 +545,90 @@ function normalizeSelectedCategories(rawCategories, version = 0) {
     return deduped;
 }
 
+function escapeHtml(text) {
+    return String(text || "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll("\"", "&quot;")
+        .replaceAll("'", "&#39;");
+}
+
+function normalizeAutocompleteToken(text) {
+    return String(text || "")
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, "_");
+}
+
+function scoreAutocompleteItem(token, item) {
+    const normalizedToken = normalizeAutocompleteToken(token);
+    const name = normalizeAutocompleteToken(item?.name || "");
+    if (!normalizedToken || !name) return -1;
+
+    let score = 0;
+    if (name === normalizedToken) score += 1000;
+    if (name.startsWith(normalizedToken)) score += 700;
+    if (name.includes(`_${normalizedToken}`)) score += 520;
+    if (name.includes(normalizedToken)) score += 350;
+
+    const tokenParts = normalizedToken.split("_").filter(Boolean);
+    if (tokenParts.length > 1 && tokenParts.every(part => name.includes(part))) {
+        score += 240;
+    }
+    if (tokenParts.length === 1 && tokenParts[0] && name.split("_").some(part => part.startsWith(tokenParts[0]))) {
+        score += 180;
+    }
+
+    const postCount = Number(item?.post_count || 0);
+    score += Math.min(120, Math.log10(Math.max(1, postCount)) * 20);
+    score -= Math.min(80, Math.max(0, name.length - normalizedToken.length));
+    return score;
+}
+
+function rankAutocompleteItems(token, items) {
+    return (Array.isArray(items) ? items : [])
+        .map(item => ({
+            item,
+            score: scoreAutocompleteItem(token, item),
+        }))
+        .filter(entry => entry.score >= 0)
+        .sort((a, b) => {
+            if (b.score !== a.score) return b.score - a.score;
+            const countDiff = Number(b.item?.post_count || 0) - Number(a.item?.post_count || 0);
+            if (countDiff !== 0) return countDiff;
+            return String(a.item?.name || "").localeCompare(String(b.item?.name || ""));
+        })
+        .map(entry => entry.item);
+}
+
+function highlightAutocompleteName(name, token) {
+    const rawName = String(name || "");
+    const normalizedToken = normalizeAutocompleteToken(token);
+    if (!rawName || !normalizedToken) return escapeHtml(rawName);
+
+    const normalizedName = normalizeAutocompleteToken(rawName);
+    const directIndex = normalizedName.indexOf(normalizedToken);
+    if (directIndex >= 0) {
+        const end = directIndex + normalizedToken.length;
+        return `${escapeHtml(rawName.slice(0, directIndex))}<b>${escapeHtml(rawName.slice(directIndex, end))}</b>${escapeHtml(rawName.slice(end))}`;
+    }
+
+    const parts = rawName.split("_");
+    const normalizedParts = parts.map(part => normalizeAutocompleteToken(part));
+    const tokenParts = normalizedToken.split("_").filter(Boolean);
+    if (!tokenParts.length) return escapeHtml(rawName);
+
+    const highlighted = parts.map((part, index) => {
+        const normalizedPart = normalizedParts[index];
+        if (tokenParts.some(tp => normalizedPart.startsWith(tp) || normalizedPart.includes(tp))) {
+            return `<b>${escapeHtml(part)}</b>`;
+        }
+        return escapeHtml(part);
+    });
+    return highlighted.join("_");
+}
+
 function getCategorizedTooltipTags(postData) {
     const sections = {};
     CATEGORY_KEYS.forEach(category => {
@@ -1137,7 +1221,7 @@ app.registerExtension({
                 state.searchInput.focus();
             }
 
-            function renderSuggestions(items) {
+            function renderSuggestions(items, token = "") {
                 state.suggestBox.innerHTML = "";
                 if (!Array.isArray(items) || !items.length) {
                     closeSuggest();
@@ -1149,7 +1233,7 @@ app.registerExtension({
                     if (!name) return;
                     const row = document.createElement("div");
                     row.className = "dtg-suggest-item";
-                    row.innerHTML = `<span>${name}</span><span>${Number(item?.post_count || 0).toLocaleString()}</span>`;
+                    row.innerHTML = `<span>${highlightAutocompleteName(name, token)}</span><span>${Number(item?.post_count || 0).toLocaleString()}</span>`;
                     row.onmousedown = event => {
                         event.preventDefault();
                         applyAutocompleteTag(name);
@@ -1186,7 +1270,8 @@ app.registerExtension({
                     }
                     const payload = await response.json();
                     if (reqId !== state.autocompleteReqId) return;
-                    renderSuggestions(Array.isArray(payload?.items) ? payload.items : []);
+                    const rankedItems = rankAutocompleteItems(token, Array.isArray(payload?.items) ? payload.items : []).slice(0, 20);
+                    renderSuggestions(rankedItems, token);
                 } catch {
                     if (reqId !== state.autocompleteReqId) return;
                     closeSuggest();
@@ -1560,7 +1645,7 @@ app.registerExtension({
                 if (state.autocompleteTimer) clearTimeout(state.autocompleteTimer);
                 state.autocompleteTimer = setTimeout(() => {
                     requestAutocomplete();
-                }, 150);
+                }, 90);
             });
             searchInput.addEventListener("keydown", event => {
                 if (event.key === "Enter") {
