@@ -575,81 +575,6 @@ function getCategorizedTooltipTags(postData) {
     return sections;
 }
 
-function hasCategorizedTooltipTags(postData) {
-    return Boolean(postData?.detail_loaded);
-}
-
-async function ensurePostDetailCategories(state, post) {
-    if (!state || !post || hasCategorizedTooltipTags(post) || !post.id) {
-        return post;
-    }
-    const postId = String(post.id || "");
-    if (!postId) return post;
-
-    const existingPromise = state.detailLoadMap.get(postId);
-    if (existingPromise) {
-        await existingPromise;
-        return state.posts.find(item => String(item.id || "") === postId) || post;
-    }
-
-    const promise = (async () => {
-        try {
-            const query = new URLSearchParams({ post_id: postId });
-            const response = await api.fetchApi(`/danbooru_tag_gallery/post_detail?${query.toString()}`, { cache: "no-store" });
-            if (!response.ok) return;
-            const payload = await response.json();
-            const detail = payload?.detail && typeof payload.detail === "object" ? payload.detail : null;
-            if (!detail) return;
-
-            const updatePost = target => {
-                if (!target || String(target.id || "") !== postId) return target;
-                target.tag_string = String(detail.tag_string ?? target.tag_string ?? "");
-                target.tag_string_artist = String(detail.tag_string_artist ?? target.tag_string_artist ?? "");
-                target.tag_string_copyright = String(detail.tag_string_copyright ?? target.tag_string_copyright ?? "");
-                target.tag_string_character = String(detail.tag_string_character ?? target.tag_string_character ?? "");
-                target.tag_string_general = String(detail.tag_string_general ?? target.tag_string_general ?? "");
-                target.tag_string_meta = String(detail.tag_string_meta ?? target.tag_string_meta ?? "");
-                target.display_url = String(detail.display_url ?? target.display_url ?? "");
-                target.image_url = String(detail.image_url ?? target.image_url ?? "");
-                target.preview_url = String(detail.preview_url ?? target.preview_url ?? "");
-                target.detail_loaded = Boolean(detail.detail_loaded ?? true);
-                if (!String(target.prompt || "").trim()) {
-                    target.prompt = toPrompt(target.tag_string);
-                }
-                return target;
-            };
-
-            state.posts.forEach(updatePost);
-            state.selectedMap.forEach(item => updatePost(item));
-            syncStateWidget(true);
-        } catch {
-            // ignore detail fetch failures and keep fallback general tags
-        }
-    })();
-
-    state.detailLoadMap.set(postId, promise);
-    try {
-        await promise;
-    } finally {
-        state.detailLoadMap.delete(postId);
-    }
-    return state.posts.find(item => String(item.id || "") === postId) || post;
-}
-
-function warmupVisiblePostDetails(state, limit = 6) {
-    if (!state || !Array.isArray(state.posts) || !state.posts.length) return;
-    const targets = state.posts
-        .filter(post => post && post.id && !post.detail_loaded)
-        .slice(0, Math.max(0, Number(limit || 0)));
-    if (!targets.length) return;
-
-    targets.forEach((post, index) => {
-        window.setTimeout(() => {
-            ensurePostDetailCategories(state, post).catch(() => {});
-        }, 80 * index);
-    });
-}
-
 function buildPromptLikeReference(postData, selectedCategories) {
     const categories = normalizeSelectedCategories(selectedCategories, 2);
     const outputTags = [];
@@ -705,7 +630,6 @@ function normalizePost(raw) {
         tag_string_character: String(post.tag_string_character ?? ""),
         tag_string_general: String(post.tag_string_general ?? ""),
         tag_string_meta: String(post.tag_string_meta ?? ""),
-        detail_loaded: Boolean(post.detail_loaded ?? false),
         prompt: String(post.prompt ?? "") || toPrompt(post.tag_string),
     };
 }
@@ -815,13 +739,8 @@ async function showTooltip(state, post, event) {
     // Render immediately with whatever data we already have so hover feels instant.
     const initialTooltip = renderTooltipContent(state, post);
     positionTooltip(initialTooltip, state.hoverPointer);
-
-    const hydratedPost = await ensurePostDetailCategories(state, post);
     if (Number(state.hoverRequestId || 0) !== requestId) return;
     if (String(state.hoveredPostId || "") !== postId) return;
-
-    const tooltip = renderTooltipContent(state, hydratedPost);
-    positionTooltip(tooltip, state.hoverPointer);
 }
 
 function syncSelectionWidget(node, selectionWidget, selectedMap) {
@@ -1054,7 +973,6 @@ app.registerExtension({
                 syncGridLayout: null,
                 tooltipEl: null,
                 hoveredPostId: "",
-                detailLoadMap: new Map(),
                 hoverRequestId: 0,
                 hoverPointer: null,
             };
@@ -1370,7 +1288,6 @@ app.registerExtension({
                     tag_string_character: post.tag_string_character || "",
                     tag_string_general: post.tag_string_general || "",
                     tag_string_meta: post.tag_string_meta || "",
-                    detail_loaded: Boolean(post.detail_loaded),
                     prompt: buildPromptLikeReference(post, selectedCategories),
                 };
             }
@@ -1538,7 +1455,6 @@ app.registerExtension({
                     state.statusEl.textContent = `Loaded ${state.posts.length} posts.`;
                     renderPosts();
                     syncStateWidget(true);
-                    warmupVisiblePostDetails(state, 6);
                 } catch (error) {
                     state.posts = [];
                     state.pendingScrollTop = 0;
