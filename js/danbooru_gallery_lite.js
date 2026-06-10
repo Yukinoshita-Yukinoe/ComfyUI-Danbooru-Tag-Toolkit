@@ -996,21 +996,22 @@ app.registerExtension({
                 const measuredTop = Number(domWidgetEl?.offsetTop || root.offsetTop || 0);
                 const widgetTop = getStableWidgetTop(measuredTop);
                 const innerHeight = Math.max(260, Math.floor(nodeHeight - widgetTop - ROOT_BOTTOM_PADDING));
+                const rootIsDomWidget = domWidgetEl === root;
 
                 if (domWidgetEl) {
                     domWidgetEl.style.width = `${innerWidth}px`;
                     domWidgetEl.style.maxWidth = `${innerWidth}px`;
+                    domWidgetEl.style.minWidth = `${innerWidth}px`;
                     domWidgetEl.style.height = `${innerHeight}px`;
                     domWidgetEl.style.maxHeight = `${innerHeight}px`;
                     domWidgetEl.style.minHeight = `${innerHeight}px`;
                     domWidgetEl.style.overflow = "hidden";
                     domWidgetEl.style.boxSizing = "border-box";
-                    domWidgetEl.style.minWidth = "0";
                 }
 
-                root.style.width = "100%";
-                root.style.maxWidth = "100%";
-                root.style.minWidth = "0";
+                root.style.width = rootIsDomWidget ? `${innerWidth}px` : "100%";
+                root.style.maxWidth = rootIsDomWidget ? `${innerWidth}px` : "100%";
+                root.style.minWidth = rootIsDomWidget ? `${innerWidth}px` : "0";
                 root.style.height = `${innerHeight}px`;
                 root.style.maxHeight = `${innerHeight}px`;
                 root.style.minHeight = `${innerHeight}px`;
