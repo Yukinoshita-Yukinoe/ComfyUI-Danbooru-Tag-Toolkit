@@ -2197,21 +2197,22 @@ function syncRootLayout(node) {
     const widgetTop = getStableWidgetTop(node, innerWidth);
     const bottomPadding = 12;
     const innerHeight = Math.max(120, Math.floor(height - widgetTop - bottomPadding));
+    const rootIsDomWidget = state.domWidgetEl === state.rootEl;
 
     if (state.domWidgetEl) {
         state.domWidgetEl.style.width = `${innerWidth}px`;
         state.domWidgetEl.style.maxWidth = `${innerWidth}px`;
+        state.domWidgetEl.style.minWidth = `${innerWidth}px`;
         state.domWidgetEl.style.height = `${innerHeight}px`;
         state.domWidgetEl.style.maxHeight = `${innerHeight}px`;
         state.domWidgetEl.style.minHeight = `${innerHeight}px`;
         state.domWidgetEl.style.overflow = "hidden";
         state.domWidgetEl.style.boxSizing = "border-box";
-        state.domWidgetEl.style.minWidth = "0";
     }
 
-    state.rootEl.style.width = "100%";
-    state.rootEl.style.maxWidth = "100%";
-    state.rootEl.style.minWidth = "0";
+    state.rootEl.style.width = rootIsDomWidget ? `${innerWidth}px` : "100%";
+    state.rootEl.style.maxWidth = rootIsDomWidget ? `${innerWidth}px` : "100%";
+    state.rootEl.style.minWidth = rootIsDomWidget ? `${innerWidth}px` : "0";
     state.rootEl.style.height = `${innerHeight}px`;
     state.rootEl.style.maxHeight = `${innerHeight}px`;
     state.rootEl.style.minHeight = `${innerHeight}px`;
