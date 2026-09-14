@@ -78,6 +78,10 @@ side), so the toolbar's `Order` selector adds a quality floor automatically:
 | `random` | `score:>200 order:random` | retried with `score:>1000` |
 
 - `Min score` (default `0` = automatic) overrides the floor with `score:>=N`.
+- Only browser-displayable still images are requested (`filetype:jpg,png,webp,gif,bmp` is appended automatically).
+  This matters a lot for the ordered modes: most all-time high-score posts are `mp4`/`webm` animations, so without the
+  filter `best score` only produced a handful of cards per page. Type `filetype:` yourself to override it.
+- Slightly more posts than requested are fetched and trimmed, so a page still fills up if a few entries have no preview image.
 - If you type `order:` / `score:` / `favcount:` yourself, nothing is added - the search box always wins.
 - The status line shows the query that was actually used, e.g. `Loaded 24 posts. · meion score:>100 order:score`.
 - Ordered queries that come back empty (Danbooru sometimes swallows a timeout) are retried once.

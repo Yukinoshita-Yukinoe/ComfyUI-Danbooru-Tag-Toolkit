@@ -1781,7 +1781,10 @@ def _cleanup_expired_cache_items(cache_dict: Dict[str, Any], ttl_seconds: int):
         cache_dict.pop(key, None)
 
 
-_ALLOWED_GALLERY_IMAGE_EXT = {"jpg", "jpeg", "png", "webp", "bmp", "tiff", "tif"}
+_ALLOWED_GALLERY_IMAGE_EXT = {"jpg", "jpeg", "png", "webp", "gif", "bmp", "tiff", "tif"}
+# 图库网格只显示浏览器能直接渲染的静态图（mp4/webm 这类动画占高分榜很大比例，真机实测占 80%）
+_GALLERY_BROWSABLE_FILE_TYPES = "jpg,png,webp,gif,bmp"
+
 # 图片/视频直链不可能是画师主页，拿去 artists?url_matches 反而会撞出莫名其妙的命中
 _MEDIA_URL_EXTENSIONS = _ALLOWED_GALLERY_IMAGE_EXT | {"gif", "mp4", "webm", "avif", "jxl"}
 
@@ -1933,6 +1936,9 @@ def _build_gallery_tag_query(tags: str, rating: str, order: str, min_score: Any,
     if score_floor > 0:
         parts.append(f"score:>={score_floor}")
 
+    if not any("filetype:" in str(part).lower() for part in parts):
+        parts.append(f"filetype:{_GALLERY_BROWSABLE_FILE_TYPES}")
+    
     joined = " ".join([p for p in parts if p]).lower()
     user_has_order = "order:" in joined
     user_has_score = "score:" in joined
@@ -1988,6 +1994,8 @@ def _fetch_gallery_posts(
         mode_key = "newest"
     mode = _GALLERY_ORDER_MODES[mode_key]
     final_tags = _build_gallery_tag_query(tags, rating, mode_key, min_score)
+    # 即使过滤了动画，仍可能有几条因为缺 preview 被丢掉：稍微超取一点把一页填满
+    fetch_limit = max(1, min(100, int(max(1, int(limit)) * 1.5)))
     notice = ""
 
     cache_key = f"{final_tags}|{int(limit)}|{int(page)}"
@@ -2037,7 +2045,7 @@ def _fetch_gallery_posts(
     for index, attempt_query in enumerate(attempt_tags):
         is_last = index == len(attempt_tags) - 1
         try:
-            posts = _request_gallery_posts(attempt_query, limit, page)
+            posts = _request_gallery_posts(attempt_query, fetch_limit, page)
             last_error = None
         except RuntimeError as exc:
             last_error = exc
@@ -2064,6 +2072,9 @@ def _fetch_gallery_posts(
         if mode_key != "newest":
             notice = "No results for this order/floor (Danbooru may have timed out; try a tag or a higher floor)."
 
+    
+    if len(posts) > int(limit):
+        posts = posts[:int(limit)]
     if last_error is not None and not posts:
         raise last_error
 

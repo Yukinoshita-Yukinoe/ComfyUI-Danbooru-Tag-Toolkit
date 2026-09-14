@@ -12,6 +12,10 @@
 ### Fixed
 
 - Ordered gallery queries that return an empty page (Danbooru occasionally swallows a timeout) are retried once.
+- Gallery pages now fill up when ordering: only browser-displayable still images are requested
+  (`filetype:jpg,png,webp,gif,bmp`) and slightly more posts are fetched before trimming. Without this, `best score` showed
+  only a few cards per page because most all-time high-score posts are `mp4`/`webm` animations (50 fetched -> 8 usable).
+- GIF posts are now supported by the gallery (browser displays them; the node output uses the first frame).
 
 ## 1.1.0 - 2026-09-14
 
