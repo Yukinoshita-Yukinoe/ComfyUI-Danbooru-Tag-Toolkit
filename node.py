@@ -1669,6 +1669,9 @@ _DANBOORU_MIN_REQUEST_INTERVAL = 1.0
 _danbooru_request_lock = threading.Lock()
 _danbooru_last_request_ts = 0.0
 
+# 自定义 User-Agent 一旦被 Cloudflare 拦（403），本进程内不再带它重试，省掉每次的 403 往返
+_UA_REJECTED_BY_403 = False
+
 
 def _danbooru_throttle() -> None:
     """所有 Danbooru API 请求共用：串行 + 最小间隔，避免被限流/临时封禁。"""
@@ -1717,10 +1720,11 @@ def _open_danbooru_url(url: str, timeout: int = 15, throttle: bool = False):
     默认带自定义 User-Agent；若被 Cloudflare 以 403 拦下，会自动退回"不带自定义头"的
     请求再试一次（部分网络环境下自定义 UA 反而更容易被风控）。
     """
+    global _UA_REJECTED_BY_403
     final_url = _absolutize_danbooru_url(url)
     if throttle:
         _danbooru_throttle()
-    user_agent = _danbooru_user_agent()
+    user_agent = "" if _UA_REJECTED_BY_403 else _danbooru_user_agent()
     if not user_agent:
         return urllib.request.urlopen(final_url, timeout=timeout)
     request = urllib.request.Request(final_url, headers={
@@ -1732,7 +1736,8 @@ def _open_danbooru_url(url: str, timeout: int = 15, throttle: bool = False):
     except urllib.error.HTTPError as exc:
         if exc.code != 403:
             raise
-        print("[DanbooruTagToolkit] custom User-Agent got HTTP 403, retrying without it")
+        _UA_REJECTED_BY_403 = True
+        print("[DanbooruTagToolkit] custom User-Agent got HTTP 403; disabling it for this session")
         return urllib.request.urlopen(final_url, timeout=timeout)
 def _tag_string_to_prompt(tag_string: Any) -> str:
     """Danbooru 的 tag_string 转成逗号分隔的提示词文本。"""
@@ -1777,6 +1782,15 @@ def _cleanup_expired_cache_items(cache_dict: Dict[str, Any], ttl_seconds: int):
 
 
 _ALLOWED_GALLERY_IMAGE_EXT = {"jpg", "jpeg", "png", "webp", "bmp", "tiff", "tif"}
+# 图片/视频直链不可能是画师主页，拿去 artists?url_matches 反而会撞出莫名其妙的命中
+_MEDIA_URL_EXTENSIONS = _ALLOWED_GALLERY_IMAGE_EXT | {"gif", "mp4", "webm", "avif", "jxl"}
+
+
+def _looks_like_media_url(url: str) -> bool:
+    """看起来是图片/视频直链（结尾是媒体扩展名）。"""
+    return str(_guess_file_ext_from_url(url)).strip().lower() in _MEDIA_URL_EXTENSIONS
+
+
 
 
 def _normalize_gallery_post(item: Any):
@@ -1861,6 +1875,27 @@ def _extract_danbooru_post_id(url: str) -> int:
         return int(match.group(1)) if match else 0
     except Exception:
         return 0
+
+
+def _source_match_token(url: str) -> str:
+    """从 source URL 里取一个足够独特的片段，用于 source:*token* 兜底查询。
+
+    Danbooru 的 source 精确匹配在超长 URL 上偶尔会 500（数据库查询超时），
+    真机实测 source:*<数字id>* 这种通配符查询是稳定的，所以用它兜底。
+    """
+    text = str(url or "")
+    try:
+        path = urllib.parse.urlsplit(text).path or ""
+    except Exception:
+        path = text
+    stem = os.path.splitext(os.path.basename(path))[0]
+    # 画师主页/用户页 URL 不该拿去做 source 查询
+    if re.search(r"/(?:users?|artists?|profile|members?)/", text.lower()):
+        return ""
+    match = re.search(r"\d{5,}", stem)
+    if match:
+        return match.group(0)
+    return stem if len(stem) >= 8 else ""
 
 
 def _extract_md5_from_url(url: str) -> str:
@@ -2136,6 +2171,10 @@ def _lookup_artist_sync(raw_url: str = "", raw_md5: str = "", max_posts: int = _
         "artist_records": [],
     }
 
+    def finish() -> Dict[str, Any]:
+        result["errors"] = api_errors
+        return result
+
     def apply(method: str, info: Dict[str, Any]) -> bool:
         attempts.append({"method": method, "hits": len(info.get("post_ids") or []), "artists": len(info.get("artists") or [])})
         if not info.get("artists"):
@@ -2149,16 +2188,24 @@ def _lookup_artist_sync(raw_url: str = "", raw_md5: str = "", max_posts: int = _
     if url:
         query = urllib.parse.urlencode({"tags": f"source:{url}", "limit": int(max_posts)})
         source_payload = _danbooru_api_json(f"/posts.json?{query}", errors=api_errors)
-        if apply("source", _extract_post_artists(source_payload)):
-            return result
+        if not apply("source", _extract_post_artists(source_payload)):
+            # 精确 source 查询失败（偶发 500 超时）或没命中：用通配符再试一次
+            token = _source_match_token(url)
+            if token:
+                wildcard_query = urllib.parse.urlencode({"tags": f"source:*{token}*", "limit": int(max_posts)})
+                wildcard_info = _extract_post_artists(_danbooru_api_json(f"/posts.json?{wildcard_query}"))
+                if apply("source_wildcard", wildcard_info):
+                    return finish()
+        else:
+            return finish()
 
     if md5_value:
         query = urllib.parse.urlencode({"tags": f"md5:{md5_value}", "limit": 5})
         md5_payload = _danbooru_api_json(f"/posts.json?{query}", errors=api_errors)
         if apply("md5", _extract_post_artists(md5_payload)):
-            return result
+            return finish()
 
-    if url:
+    if url and not _looks_like_media_url(url):
         records = _artist_records_by_url(url, errors=api_errors)
         attempts.append({"method": "artist_url", "hits": len(records), "artists": len(records)})
         if records:
@@ -2166,10 +2213,10 @@ def _lookup_artist_sync(raw_url: str = "", raw_md5: str = "", max_posts: int = _
             result["artists"] = [entry["name"] for entry in records]
             result["artist_ids"] = [entry["id"] for entry in records]
             result["artist_records"] = records
-            return result
+            return finish()
 
     result["errors"] = api_errors
-    return result
+    return finish()
 
 
 def _resolve_gallery_url(raw_url: str) -> Dict[str, Any]:
@@ -2194,6 +2241,7 @@ def _resolve_gallery_url(raw_url: str) -> Dict[str, Any]:
         "matched_by": "none",
         "message": "",
         "errors": [],
+        "attempts": [],
     }
     if not url:
         result["message"] = "Empty URL."
@@ -2221,9 +2269,10 @@ def _resolve_gallery_url(raw_url: str) -> Dict[str, Any]:
 
     md5_guess = _extract_md5_from_url(url)
     lookup = _lookup_artist_sync(url, md5_guess)
-    result["errors"] = list(lookup.get("errors") or [])
+    result["errors"].extend(list(lookup.get("errors") or []))
+    result["attempts"] = list(lookup.get("attempts") or [])
 
-    if lookup.get("matched_by") in {"source", "md5"} and lookup.get("post_ids"):
+    if lookup.get("matched_by") in {"source", "md5", "source_wildcard"} and lookup.get("post_ids"):
         matched = _fetch_gallery_post_by_id(lookup["post_ids"][0])
         if matched:
             result.update({
@@ -2248,12 +2297,19 @@ def _resolve_gallery_url(raw_url: str) -> Dict[str, Any]:
             "artist_url": f"{site}/artists/{first_id}" if first_id else f"{site}/posts?tags={urllib.parse.quote(artists[0])}",
             "search_tags": artists[0],
             "matched_by": "artist_url",
-            "message": f"Artist: {artists[0]}" + (f" (+{len(artists) - 1} more candidates)" if len(artists) > 1 else ""),
+            "message": (
+                f"Artist: {artists[0]}"
+                + (f" (+{len(artists) - 1} more candidates)" if len(artists) > 1 else "")
+                + (f" - source lookup failed: {result['errors'][0][:90]}" if result["errors"] else "")
+            ),
         })
         return result
 
     if not result["message"]:
-        result["message"] = "Danbooru 上没有找到这个链接对应的帖子或画师（这张图可能没被上传过）。"
+        if result["errors"]:
+            result["message"] = f"Lookup failed: {result['errors'][0]}"
+        else:
+            result["message"] = "Danbooru 上没有找到这个链接对应的帖子或画师（这张图可能没被上传过）。"
     return result
 
 
