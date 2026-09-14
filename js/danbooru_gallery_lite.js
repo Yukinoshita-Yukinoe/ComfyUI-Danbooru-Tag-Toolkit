@@ -226,6 +226,44 @@ function injectStyle() {
             height: auto;
             display: block;
         }
+        .dtg-thumb-wrap.dtg-thumb-failed {
+            min-height: 140px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 1px dashed #454545;
+        }
+        .dtg-thumb-wrap.dtg-thumb-failed .dtg-thumb {
+            display: none;
+        }
+        .dtg-thumb-retry {
+            cursor: pointer;
+            border: 1px solid #555;
+            border-radius: 6px;
+            background: #262626;
+            color: #ddd;
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+        .dtg-thumb-retry:hover {
+            background: #333;
+            border-color: #777;
+        }
+        .dtg-artist {
+            padding: 0 6px 6px;
+            color: #8fb3d9;
+            font-size: 10px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .dtg-artist a {
+            color: #9fc4e8;
+            text-decoration: none;
+        }
+        .dtg-artist a:hover {
+            text-decoration: underline;
+        }
         .dtg-meta {
             padding: 6px;
             display: flex;
@@ -617,6 +655,7 @@ function normalizePost(raw) {
         rating: String(post.rating ?? ""),
         file_ext: String(post.file_ext ?? ""),
         md5: String(post.md5 ?? ""),
+        source: String(post.source ?? ""),
         display_url: String(post.display_url ?? ""),
         preview_url: String(post.preview_url ?? ""),
         image_url: String(post.image_url ?? ""),
@@ -1043,7 +1082,7 @@ app.registerExtension({
                 const maxColumns = narrow ? 2 : 3;
                 const columns = Math.max(1, Math.min(maxColumns, Math.floor(gridWidth / minCardWidth) || 1));
                 grid.style.gridTemplateColumns = `repeat(${columns}, minmax(0, 1fr))`;
-                requestAnimationFrame(() => resizeAllMasonryCards());
+                resizeAllMasonryCards();
             };
             const scheduleGridLayoutSync = (delay = 120) => {
                 syncGridLayout(this.size);
@@ -1070,6 +1109,13 @@ app.registerExtension({
                     state.layoutTimeoutId = null;
                     this.setDirtyCanvas?.(true, true);
                 }, Math.max(0, delay));
+            };
+            // 画布缩放（Ctrl+滚轮）不会触发 onResize，这里借节点绘制回调检测缩放变化
+            const originalOnDrawForeground = this.onDrawForeground;
+            this.onDrawForeground = function (ctx, canvas, canvasEl) {
+                const result = originalOnDrawForeground?.apply(this, arguments);
+                checkMasonryLayoutChanged();
+                return result;
             };
             this.onResize = size => {
                 originalOnResize?.call(this, size);
@@ -1240,7 +1286,19 @@ app.registerExtension({
                     meta.className = "dtg-picked-meta";
                     const idLine = document.createElement("div");
                     idLine.className = "dtg-picked-id";
+                    const pickedArtist = String(item?.tag_string_artist || "").trim();
                     idLine.textContent = postId ? `#${postId}` : "(no id)";
+                    if (pickedArtist) {
+                        const pickedArtistLink = document.createElement("a");
+                        pickedArtistLink.href = artistSearchUrl(pickedArtist);
+                        pickedArtistLink.target = "_blank";
+                        pickedArtistLink.rel = "noreferrer noopener";
+                        pickedArtistLink.textContent = ` · ${pickedArtist}`;
+                        pickedArtistLink.title = "Open this artist on Danbooru";
+                        pickedArtistLink.style.color = "#8fb3d9";
+                        pickedArtistLink.onclick = event => event.stopPropagation();
+                        idLine.appendChild(pickedArtistLink);
+                    }
                     const promptLine = document.createElement("div");
                     promptLine.className = "dtg-picked-prompt";
                     promptLine.textContent = String(item?.prompt || item?.tag_string || "").trim() || "(empty prompt)";
@@ -1293,29 +1351,298 @@ app.registerExtension({
                 };
             }
 
-            function resizeMasonryCard(card) {
-                if (!card) return;
+            // 用接口给的宽高算出「实际显示的那张图」的宽高比。
+            // 之前卡片高度完全靠图片加载后再测量，测早了/测晚了就会有卡片比图矮，
+            // 被 .dtg-card{overflow:hidden} 截成半张图。有比例后第一帧就是对的。
+            function resolveThumbAspectRatio(post) {
+                if (!post) return 0;
+                const pairs = [];
+                const displayUrl = String(post.display_url || "");
+                if (displayUrl && displayUrl === post.image_url) {
+                    pairs.push([post.image_width, post.image_height]);
+                }
+                if (displayUrl && displayUrl === post.preview_url) {
+                    pairs.push([post.preview_width, post.preview_height]);
+                }
+                pairs.push([post.image_width, post.image_height], [post.preview_width, post.preview_height]);
+                for (const [rawWidth, rawHeight] of pairs) {
+                    const width = Number(rawWidth) || 0;
+                    const height = Number(rawHeight) || 0;
+                    if (width > 0 && height > 0) return width / height;
+                }
+                return 0;
+            }
+
+            // ---- 瀑布流卡片尺寸：读-写分离 + 合并批量 ----
+            // 旧实现每张图 onload 都「读高度 → 写 gridRowEnd」，一页 24~100 张图会产生
+            // 24~100 次强制同步重排（layout thrash）。这里统一改成：
+            //   一次性读全部卡片高度 → 一次性写全部 gridRowEnd
+            let masonrySyncRafId = 0;
+            let masonrySyncTimerId = 0;
+
+            function readMasonryMetrics() {
+                if (!state.grid) return null;
                 const gridStyle = window.getComputedStyle(state.grid);
                 const rowGap =
-                    Number.parseInt(gridStyle.getPropertyValue("row-gap"), 10) ||
-                    Number.parseInt(gridStyle.getPropertyValue("grid-row-gap"), 10) ||
+                    Number.parseFloat(gridStyle.getPropertyValue("row-gap")) ||
+                    Number.parseFloat(gridStyle.getPropertyValue("grid-row-gap")) ||
                     8;
                 const rowHeight = Number.parseInt(gridStyle.getPropertyValue("grid-auto-rows"), 10) || 1;
-                const img = card.querySelector(".dtg-thumb");
-                const meta = card.querySelector(".dtg-meta");
-                const imgHeight = img?.getBoundingClientRect?.().height || img?.clientHeight || 0;
-                const metaHeight = meta?.getBoundingClientRect?.().height || meta?.clientHeight || 0;
-                const total = Math.ceil(imgHeight + metaHeight + 2);
-                if (total <= 0) return;
-                const span = Math.max(1, Math.ceil((total + rowGap) / (rowHeight + rowGap)));
-                card.style.gridRowEnd = `span ${span}`;
+                // ComfyUI 会给 DOM widget 套 transform: scale(canvas zoom)，
+                // getBoundingClientRect() 拿到的是缩放后的尺寸，而 grid-auto-rows / span
+                // 都是未缩放的 CSS px —— 不换算的话 zoom<1 时卡片会比图矮，图被裁掉。
+                const gridRect = state.grid.getBoundingClientRect?.();
+                const gridLayoutWidth = Number(state.grid.offsetWidth) || 0;
+                const layoutScale = (gridRect && gridRect.width > 0 && gridLayoutWidth > 0)
+                    ? (gridRect.width / gridLayoutWidth)
+                    : 1;
+                const toLayoutPx = value => (layoutScale > 0 ? (Number(value) || 0) / layoutScale : (Number(value) || 0));
+                const cards = state.grid.querySelectorAll(".dtg-card");
+                if (!cards.length) return null;
+                const metrics = [];
+                cards.forEach(card => {
+                    const img = card.querySelector(".dtg-thumb");
+                    const meta = card.querySelector(".dtg-meta");
+                    const artistEl = card.querySelector(".dtg-artist");
+                    const imgHeight = toLayoutPx(img?.getBoundingClientRect?.().height || img?.clientHeight || 0);
+                    const metaHeight = toLayoutPx(meta?.getBoundingClientRect?.().height || meta?.clientHeight || 0);
+                    const artistHeight = toLayoutPx(artistEl?.getBoundingClientRect?.().height || 0);
+                    const total = Math.ceil(imgHeight + metaHeight + artistHeight + 2);
+                    if (total <= 0) return;
+                    metrics.push({
+                        card,
+                        span: Math.max(1, Math.ceil((total + rowGap) / (rowHeight + rowGap))),
+                    });
+                });
+                return metrics;
+            }
+
+            function applyMasonryMetrics(metrics) {
+                if (!metrics) return;
+                metrics.forEach(({ card, span }) => {
+                    // span 没变就不写，省掉一次样式失效
+                    if (card.dataset.masonrySpan === String(span)) return;
+                    card.dataset.masonrySpan = String(span);
+                    card.style.gridRowEnd = `span ${span}`;
+                });
+            }
+
+            let masonryLastScale = 0;
+            let masonryLastWidth = 0;
+            let masonryResizeObserver = null;
+
+            // 画布缩放或网格宽度变化后，卡片高度会变，必须重新排一次
+            function checkMasonryLayoutChanged() {
+                const scale = Number(app.canvas?.ds?.scale) || 1;
+                const width = Number(state.grid?.offsetWidth) || 0;
+                const changed = scale !== masonryLastScale || (width > 0 && width !== masonryLastWidth);
+                masonryLastScale = scale;
+                masonryLastWidth = width;
+                if (changed) scheduleMasonrySync(0);
+            }
+
+            function setupMasonryResizeObserver() {
+                if (masonryResizeObserver || typeof ResizeObserver === "undefined" || !state.grid) return;
+                masonryResizeObserver = new ResizeObserver(entries => {
+                    const entry = entries && entries[0];
+                    const width = Math.round(entry?.contentRect?.width || 0);
+                    if (!width || width === masonryLastWidth) return;
+                    masonryLastWidth = width;
+                    scheduleMasonrySync(0);
+                });
+                masonryResizeObserver.observe(state.grid);
+                state.masonryResizeObserver = masonryResizeObserver;
+            }
+
+            function teardownMasonryResizeObserver() {
+                masonryResizeObserver?.disconnect();
+                masonryResizeObserver = null;
+                state.masonryResizeObserver = null;
+                masonryLastScale = 0;
+                masonryLastWidth = 0;
+            }
+
+            function syncMasonryNow() {
+                if (!state.grid?.isConnected) return;
+                applyMasonryMetrics(readMasonryMetrics());
+            }
+
+            // delay = 0：下一帧立刻对齐；delay > 0：给一批图片加载做尾去抖（合并成一次）
+            function scheduleMasonrySync(delay = 0) {
+                if (masonrySyncTimerId) {
+                    clearTimeout(masonrySyncTimerId);
+                    masonrySyncTimerId = 0;
+                }
+                if (masonrySyncRafId) return;
+                const run = () => {
+                    masonrySyncRafId = 0;
+                    syncMasonryNow();
+                };
+                if (delay > 0) {
+                    masonrySyncTimerId = setTimeout(() => {
+                        masonrySyncTimerId = 0;
+                        masonrySyncRafId = window.requestAnimationFrame(run);
+                    }, delay);
+                } else {
+                    masonrySyncRafId = window.requestAnimationFrame(run);
+                }
             }
 
             function resizeAllMasonryCards() {
-                state.grid.querySelectorAll(".dtg-card").forEach(card => resizeMasonryCard(card));
+                scheduleMasonrySync(0);
             }
 
+            function cancelMasonrySync() {
+                if (masonrySyncRafId) {
+                    window.cancelAnimationFrame(masonrySyncRafId);
+                    masonrySyncRafId = 0;
+                }
+                if (masonrySyncTimerId) {
+                    clearTimeout(masonrySyncTimerId);
+                    masonrySyncTimerId = 0;
+                }
+            }
+
+            // ---- 缩略图加载：瞬时失败自动重试，彻底失败只显示占位 ----
+            // 旧实现两个 URL 各失败一次就 card.remove() + 从 state.posts 删掉 + syncStateWidget，
+            // 一次瞬时失败（慢/超时/上游 403）就会让这张图永久消失，只能刷新页面找回。
+            const THUMB_MAX_RETRIES_PER_URL = 2;   // 每个候选 URL 额外重试 2 次（最多 6 次请求）
+            const THUMB_RETRY_BASE_DELAY = 400;    // 400ms / 800ms 指数退避
+
+            function buildThumbAttempts(primaryUrl, fallbackUrl) {
+                const candidates = [];
+                [primaryUrl, fallbackUrl].forEach(url => {
+                    const text = String(url || "").trim();
+                    if (text && !candidates.includes(text)) candidates.push(text);
+                });
+                const attempts = [];
+                candidates.forEach(url => {
+                    for (let retry = 0; retry <= THUMB_MAX_RETRIES_PER_URL; retry += 1) {
+                        attempts.push({
+                            url,
+                            retry,
+                            // 同一个 URL 内指数退避 400ms / 800ms；换下一个候选 URL 时立即重试
+                            delayMs: retry > 0 ? THUMB_RETRY_BASE_DELAY * Math.pow(2, retry - 1) : 0,
+                        });
+                    }
+                });
+
+                return attempts;
+            }
+
+            function thumbAttemptUrl(attempt) {
+                if (!attempt) return "";
+                const base = buildProxyImageUrl(attempt.url);
+                if (!attempt.retry) return base;
+                // 重试时加参数绕开缓存，避免浏览器/服务端把上一次的失败结果再喂回来
+                return `${base}${base.includes("?") ? "&" : "?"}dtt_retry=${attempt.retry}-${Date.now()}`;
+            }
+
+            function clearThumbRetryTimers() {
+                if (!state.thumbRetryTimers) return;
+                state.thumbRetryTimers.forEach(timerId => clearTimeout(timerId));
+                state.thumbRetryTimers.clear();
+            }
+
+            function setupThumbLoader(imgElement, wrapElement, postData) {
+                if (!imgElement || !wrapElement) return;
+                state.thumbRetryTimers = state.thumbRetryTimers || new Set();
+                const attempts = buildThumbAttempts(
+                    postData?.display_url || postData?.preview_url || postData?.image_url || "",
+                    postData?.preview_url || postData?.image_url || ""
+                );
+                let attemptIndex = 0;
+                let retryTimer = 0;
+                let finished = false;
+
+                const clearRetryTimer = () => {
+                    if (!retryTimer) return;
+                    clearTimeout(retryTimer);
+                    state.thumbRetryTimers.delete(retryTimer);
+                    retryTimer = 0;
+                };
+
+                const removeRetryPlaceholder = () => {
+                    wrapElement.classList.remove("dtg-thumb-failed");
+                    wrapElement.querySelector?.(".dtg-thumb-retry")?.remove();
+                };
+
+                const showFailure = () => {
+                    finished = true;
+                    imgElement.dataset.thumbState = "failed";
+                    imgElement.removeAttribute?.("src");
+                    wrapElement.classList.add("dtg-thumb-failed");
+                    if (!wrapElement.querySelector?.(".dtg-thumb-retry")) {
+                        const retryButton = document.createElement("button");
+                        retryButton.type = "button";
+                        retryButton.className = "dtg-thumb-retry";
+                        retryButton.textContent = "Retry";
+                        retryButton.title = "Image failed to load. Click to retry.";
+                        retryButton.addEventListener("click", event => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            removeRetryPlaceholder();
+                            finished = false;
+                            attemptIndex = 0;
+                            clearRetryTimer();
+                            loadAttempt(0);
+                            scheduleMasonrySync(80);
+                        });
+                        wrapElement.appendChild(retryButton);
+                    }
+                    // 关键：这里不再删 state.posts / 不再删选中 / 不再 syncStateWidget / 不再 card.remove()
+                    scheduleMasonrySync(80);
+                };
+
+                const loadAttempt = index => {
+                    const attempt = attempts[index];
+                    if (!attempt) {
+                        showFailure();
+                        return;
+                    }
+                    imgElement.src = thumbAttemptUrl(attempt);
+                };
+
+                const scheduleRetry = () => {
+                    attemptIndex += 1;
+                    const next = attempts[attemptIndex];
+                    if (!next) {
+                        showFailure();
+                        return;
+                    }
+                    clearRetryTimer();
+                    retryTimer = setTimeout(() => {
+                        state.thumbRetryTimers.delete(retryTimer);
+                        retryTimer = 0;
+                        loadAttempt(attemptIndex);
+                    }, next.delayMs);
+                    state.thumbRetryTimers.add(retryTimer);
+                };
+
+                imgElement.onload = () => {
+                    finished = false;
+                    clearRetryTimer();
+                    imgElement.dataset.thumbState = "ok";
+                    removeRetryPlaceholder();
+                    scheduleMasonrySync(80);
+                };
+                imgElement.onerror = () => {
+                    if (finished) return;
+                    scheduleRetry();
+                };
+
+                if (!attempts.length) {
+                    showFailure();
+                    return;
+                }
+                loadAttempt(0);
+            }
+
+
             function renderPosts() {
+                cancelMasonrySync();
+                clearThumbRetryTimers();
+                setupMasonryResizeObserver();
                 state.grid.innerHTML = "";
                 if (!state.posts.length) {
                     state.grid.style.gridAutoRows = "auto";
@@ -1339,36 +1666,26 @@ app.registerExtension({
 
                     const img = document.createElement("img");
                     img.className = "dtg-thumb";
-                    const primaryThumbUrl = post.display_url || post.preview_url || post.image_url || "";
-                    const fallbackThumbUrl = post.preview_url || post.image_url || "";
-                    img.src = buildProxyImageUrl(primaryThumbUrl);
                     img.alt = String(post.id || "");
                     img.loading = "lazy";
-                    img.onload = () => {
-                        resizeMasonryCard(card);
-                    };
+                    // 有宽高比时先占好位置：卡片高度立刻正确，也不会出现加载后跳动
+                    const thumbAspectRatio = resolveThumbAspectRatio(post);
+                    if (thumbAspectRatio > 0) {
+                        img.style.aspectRatio = String(thumbAspectRatio);
+                        img.style.objectFit = "contain";   // 比例若有偏差也只留边，不拉伸/不裁切
+                    }
                     const thumbWrap = document.createElement("div");
                     thumbWrap.className = "dtg-thumb-wrap";
-                    img.onerror = () => {
-                        if (img.dataset.fallbackTried !== "1" && fallbackThumbUrl && fallbackThumbUrl !== primaryThumbUrl) {
-                            img.dataset.fallbackTried = "1";
-                            img.src = buildProxyImageUrl(fallbackThumbUrl);
-                            return;
-                        }
-                        state.posts = state.posts.filter(p => p.id !== post.id);
-                        if (state.selectedMap.has(post.id)) {
-                            state.selectedMap.delete(post.id);
-                            saveSelection();
-                        } else {
-                            updateSummary();
-                        }
-                        syncStateWidget(true);
-                        card.remove();
-                    };
+                    // 缩略图统一走「自动重试 + 失败占位」：失败不再删卡片、不再删 post
+                    setupThumbLoader(img, thumbWrap, post);
 
                     const meta = document.createElement("div");
                     meta.className = "dtg-meta";
-                    meta.innerHTML = `<span>#${post.id || "?"}</span><span>${post.rating || ""} ${post.score || 0}</span>`;
+                    const metaIdEl = document.createElement("span");
+                    metaIdEl.textContent = "#" + String(post.id || "?");
+                    const metaStatEl = document.createElement("span");
+                    metaStatEl.textContent = String(post.rating || "") + " " + String(post.score || 0);
+                    meta.replaceChildren(metaIdEl, metaStatEl);
                     const checkBadge = document.createElement("div");
                     checkBadge.className = "dtg-check";
                     checkBadge.textContent = "Selected";
@@ -1378,6 +1695,20 @@ app.registerExtension({
                     card.appendChild(thumbWrap);
                     card.appendChild(checkBadge);
                     card.appendChild(meta);
+                    const artistText = String(post.tag_string_artist || "").trim();
+                    if (artistText) {
+                        const artistLine = document.createElement("div");
+                        artistLine.className = "dtg-artist";
+                        const artistLink = document.createElement("a");
+                        artistLink.href = artistSearchUrl(artistText);
+                        artistLink.target = "_blank";
+                        artistLink.rel = "noreferrer noopener";
+                        artistLink.textContent = artistText;
+                        artistLink.title = "Open this artist on Danbooru";
+                        artistLink.onclick = event => event.stopPropagation();
+                        artistLine.appendChild(artistLink);
+                        card.appendChild(artistLine);
+                    }
                     thumbWrap.addEventListener("mouseenter", event => showTooltip(state, post, event));
                     thumbWrap.addEventListener("mousemove", event => moveTooltip(state, event));
                     thumbWrap.addEventListener("mouseleave", () => hideTooltip(state));
@@ -1397,16 +1728,98 @@ app.registerExtension({
                     };
 
                     state.grid.appendChild(card);
-                    requestAnimationFrame(() => resizeMasonryCard(card));
                 });
 
-                requestAnimationFrame(() => resizeAllMasonryCards());
+                scheduleMasonrySync();
                 updateSummary();
                 if (state.pendingScrollTop > 0) {
                     requestAnimationFrame(() => {
                         state.grid.scrollTop = state.pendingScrollTop;
                     });
                 }
+            }
+
+            const DANBOURU_SITE_URL = "https://danbooru.donmai.us";
+
+            function isUrlLike(rawText) {
+                return /^(https?:\/\/|\/\/)/i.test(String(rawText || "").trim());
+            }
+
+            function artistSearchUrl(artistTag) {
+                const first = String(artistTag || "").trim().split(" ")[0];
+                return first ? `${DANBOURU_SITE_URL}/posts?tags=${encodeURIComponent(first)}` : "";
+            }
+
+            function setStatus(text, link) {
+                state.statusEl.textContent = "";
+                state.statusEl.appendChild(document.createTextNode(String(text || "")));
+                const href = String(link?.href || "").trim();
+                if (!href) return;
+                state.statusEl.appendChild(document.createTextNode(" "));
+                const anchor = document.createElement("a");
+                anchor.href = href;
+                anchor.target = "_blank";
+                anchor.rel = "noreferrer noopener";
+                anchor.textContent = String(link?.text || "Open on Danbooru");
+                anchor.style.color = "#8fb3d9";
+                anchor.style.textDecoration = "underline";
+                state.statusEl.appendChild(anchor);
+            }
+
+            async function resolveUrlInput(rawText) {
+                const url = String(rawText || "").trim();
+                if (!url) return;
+                state.statusEl.textContent = "Resolving URL...";
+                loadBtn.disabled = true;
+                try {
+                    const query = new URLSearchParams({ url });
+                    const response = await api.fetchApi(`/danbooru_tag_picker/resolve?${query.toString()}`, { cache: "no-store" });
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+                    const payload = await response.json();
+                    const kind = String(payload?.kind || "none");
+
+                    if (kind === "post" && payload.post) {
+                        state.posts = [normalizePost(payload.post)];
+                        state.page = 1;
+                        state.pendingScrollTop = 0;
+                        renderPosts();
+                        syncStateWidget(true);
+                        const label = payload.matched_by === "post_url" ? "Danbooru post" : `post matched by ${payload.matched_by}`;
+                        setStatus(`Loaded ${label}.`, { href: payload.post_url, text: "Open post page" });
+                        return;
+                    }
+
+                    if (kind === "artist" && payload.search_tags) {
+                        const artistName = String(payload.search_tags);
+                        const extra = Number(payload.artist_extra) || 0;
+                        searchInput.value = artistName;
+                        syncStateWidget(false);
+                        setStatus(
+                            `Artist: ${artistName}${extra > 0 ? ` (+${extra} more candidates)` : ""}`,
+                            { href: payload.artist_url, text: "Open artist page" }
+                        );
+                        await loadPosts(1);
+                        return;
+                    }
+
+                    state.statusEl.textContent = String(payload?.message || "Nothing found on Danbooru for this URL.");
+                } catch (error) {
+                    state.statusEl.textContent = `Resolve failed: ${error?.message || "unknown error"}`;
+                } finally {
+                    loadBtn.disabled = false;
+                }
+            }
+
+            async function submitSearch() {
+                closeSuggest();
+                const rawText = String(searchInput.value || "").trim();
+                if (isUrlLike(rawText)) {
+                    await resolveUrlInput(rawText);
+                    return;
+                }
+                loadPosts(1);
             }
 
             async function loadPosts(page) {
@@ -1466,6 +1879,8 @@ app.registerExtension({
                     state.loading = false;
                 }
             }
+
+
 
             async function clearServerCache() {
                 try {
@@ -1529,7 +1944,7 @@ app.registerExtension({
             updateSelectedPromptsByCategory();
             saveSelection();
 
-            loadBtn.onclick = () => loadPosts(1);
+            loadBtn.onclick = () => { submitSearch(); };
             prevBtn.onclick = () => loadPosts(Math.max(1, state.page - 1));
             nextBtn.onclick = () => loadPosts(state.page + 1);
             const commitPageJump = () => {
@@ -1561,12 +1976,12 @@ app.registerExtension({
                 if (state.autocompleteTimer) clearTimeout(state.autocompleteTimer);
                 state.autocompleteTimer = setTimeout(() => {
                     requestAutocomplete();
-                }, 150);
+                }, 350);
             });
             searchInput.addEventListener("keydown", event => {
                 if (event.key === "Enter") {
                     closeSuggest();
-                    loadPosts(1);
+                    submitSearch();
                 }
                 if (event.key === "Escape") {
                     closeSuggest();
@@ -1624,6 +2039,9 @@ app.registerExtension({
         const onRemoved = nodeType.prototype.onRemoved;
         nodeType.prototype.onRemoved = function () {
             const state = this.__dtgState;
+            state?.masonryResizeObserver?.disconnect();
+            state?.thumbRetryTimers?.forEach?.(timerId => clearTimeout(timerId));
+            state?.thumbRetryTimers?.clear?.();
             if (state?.layoutRafId) {
                 cancelAnimationFrame(state.layoutRafId);
                 state.layoutRafId = null;

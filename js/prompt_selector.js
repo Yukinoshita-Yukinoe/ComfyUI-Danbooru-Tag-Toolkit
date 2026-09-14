@@ -504,6 +504,32 @@ class PromptDataSyncManager {
     }
 }
 
+// CSS 选择器里的动态取值转义（分类名 / id 可能来自导入的词库，含引号会让 querySelector 抛错）
+const cssEscapeValue = value => {
+    const text = String(value ?? "");
+    if (typeof CSS !== "undefined" && CSS.escape) return CSS.escape(text);
+    return text.replace(/[\\"\]]/g, ch => "\\" + ch);
+};
+
+// 预览图复用：同一张图不重复设置 src —— 旧写法每次 hover 都拼 ?t=Date.now()，
+// 会让浏览器反复重新下载同一张图（闪烁 + 浪费带宽）
+const setPreviewImage = (container, imageName, imageClass) => {
+    if (!container) return;
+    const name = String(imageName ?? "");
+    const existing = container.querySelector("img");
+    if (existing && (existing.dataset.previewName || "") === name) return;
+    const img = existing || document.createElement("img");
+    if (imageClass) img.className = imageClass;
+    img.alt = "Preview";
+    if (name) {
+        img.dataset.previewName = name;
+        img.src = "/dtt_prompt_selector/preview/" + encodeURIComponent(name);
+    } else {
+        img.removeAttribute("src");
+    }
+    if (img.parentNode !== container) container.replaceChildren(img);
+};
+
 // 提示词选择器节点
 app.registerExtension({
     name: "Comfy.DanbooruPromptSelector",
@@ -680,7 +706,47 @@ app.registerExtension({
                 this.sidePreviewNodeHover = false;
                 this.sidePreviewDock = null;
                 this.sidePreviewDockRaf = 0;
+                this.sidePreviewDockVisible = false;
+                this.sidePreviewDockLastTick = 0;
+                this.sidePreviewDockLastLayoutKey = "";
 
+                // 选中/取消选中时驱动预览面板。
+                // 旧实现靠每个节点实例常驻 rAF 轮询 selected_nodes，节点一多就白烧 CPU。
+                const originalOnSelected = this.onSelected;
+                this.onSelected = function () {
+                    const result = originalOnSelected?.apply(this, arguments);
+                    this.ensureSidePreviewDock?.();
+                    this.startSidePreviewDockLoop?.();
+                    // litegraph 是先调 onSelected 再写 selected_nodes，所以延后一帧再判定
+                    window.requestAnimationFrame?.(() => this.updateSidePreviewDockPosition?.());
+                    return result;
+                };
+                const originalOnDeselected = this.onDeselected;
+                this.onDeselected = function () {
+                    const result = originalOnDeselected?.apply(this, arguments);
+                    window.requestAnimationFrame?.(() => {
+                        this.updateSidePreviewDockPosition?.();
+                        if (!this.isPromptSelectorSelected?.()) this.stopSidePreviewDockLoop?.();
+                    });
+                    return result;
+                };
+
+                // ---- 悬浮 DOM 元素归属管理（多节点隔离） ----
+                // 每个节点实例一个 token，创建时打到元素上，查找/清理都按这个 token 过滤，
+                // 避免 A 节点的操作影响 B 节点的弹窗、tooltip、预览面板。
+                const dttOwnerToken = `dtt-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+                this.dttOwnerToken = dttOwnerToken;
+                const ownedSelector = selector => String(selector)
+                    .split(",")
+                    .map(part => `${part.trim()}[data-dtt-owner="${dttOwnerToken}"]`)
+                    .join(",");
+                const queryOwned = selector => document.querySelector(ownedSelector(selector));
+                const queryOwnedAll = selector => document.querySelectorAll(ownedSelector(selector));
+                const appendFloating = el => {
+                    if (el) el.dataset.dttOwner = dttOwnerToken;
+                    document.body.appendChild(el);
+                    return el;
+                };
                 // 保存队列和状态跟踪（防止并发冲突）
                 this.saveQueue = Promise.resolve(); // 保存队列，确保串行保存
                 this.isSaving = false; // 当前是否正在保存
@@ -707,10 +773,16 @@ app.registerExtension({
                 mainContainer.addEventListener("mouseenter", () => {
                     this.sidePreviewNodeHover = true;
                     this.ensureSidePreviewDock?.();
+                    this.startSidePreviewDockLoop?.();
                     this.updateSidePreviewDockPosition?.();
                 });
                 mainContainer.addEventListener("mouseleave", () => {
                     this.sidePreviewNodeHover = false;
+                    this.updateSidePreviewDockPosition?.();
+                    // 只有「既没被选中也没悬停」时才彻底停掉 rAF
+                    if (!this.isPromptSelectorSelected?.()) {
+                        this.stopSidePreviewDockLoop?.();
+                    }
                 });
 
                 // --- 中央内容区 (现在由模态框处理，此区域可简化或移除) ---
@@ -990,19 +1062,6 @@ app.registerExtension({
                     this.showLibraryModal();
                 });
 
-                this.checkPromptInLibrary = () => {
-                    const textWidget = this.widgets.find(w => w.type === 'text' || w.type === 'string');
-                    if (!textWidget || !this.promptData) return;
-                    const currentPrompt = textWidget.value;
-                    const allPrompts = this.promptData.categories.flatMap(c => c.prompts);
-                    const isInLibrary = allPrompts.some(p => p.prompt === currentPrompt);
-
-                    if (isInLibrary) {
-                        libraryButton.classList.add('highlight');
-                    } else {
-                        libraryButton.classList.remove('highlight');
-                    }
-                };
 
                 const settingsBtn = footer.querySelector("#ps-settings-btn");
                 settingsBtn.addEventListener("click", () => {
@@ -1211,26 +1270,65 @@ app.registerExtension({
                 };
 
                 this.isPromptSelectorSelected = () => {
-                    const selectedNodes = app.canvas?.selected_nodes;
+                    const isSameNode = node => node === this
+                        || (!!node && String(node.id) === String(this.id) && (!this.graph || node.graph === this.graph));
+                    const canvas = this.graph?.canvas
+                        // app.canvas.graph 在旧前端可能不存在，此时退化为直接使用当前画布的选择集
+                        || (app.canvas && (!this.graph || !app.canvas.graph || app.canvas.graph === this.graph) ? app.canvas : null);
+                    const selectedNodes = canvas?.selected_nodes;
                     if (!selectedNodes) return false;
-                    if (Array.isArray(selectedNodes)) {
-                        return selectedNodes.some(node => node === this || node?.id === this.id);
-                    }
-                    if (selectedNodes instanceof Set) {
+                    if (typeof selectedNodes.values === "function") {
                         for (const node of selectedNodes.values()) {
-                            if (node === this || node?.id === this.id) return true;
+                            if (isSameNode(node)) return true;
                         }
                         return false;
                     }
+                    if (Array.isArray(selectedNodes)) {
+                        return selectedNodes.some(isSameNode);
+                    }
                     if (typeof selectedNodes === "object") {
-                        if (selectedNodes[this.id]) return true;
-                        return Object.values(selectedNodes).some(node => node === this || node?.id === this.id);
+                        return Object.values(selectedNodes).some(isSameNode);
                     }
                     return false;
                 };
 
+                // 词库弹窗按节点实例持有：旧版用全局 document.querySelector('.ps-library-modal')，
+                // 两个 Prompt Selector 节点会抢同一个弹窗、互相刷新/关闭
+                this.libraryModalEl = null;
+                this.libraryModalOpening = false;
+                this.getLibraryModal = () => (this.libraryModalEl?.isConnected ? this.libraryModalEl : null);
+
+                // 节点必须仍在当前画布（工作流）中，避免切换画布后面板残留在别的画布上
+                this.isPromptSelectorInActiveCanvas = () => {
+                    const graph = this.graph;
+                    const canvas = app.canvas;
+                    // 拿不到画布信息时不阻止显示（锚点矩形检查仍然生效）；
+                    // 能拿到时要求节点所在 graph 就是当前画布，避免面板跑到其它画布上。
+                    if (!graph || !canvas?.graph) return true;
+                    return canvas.graph === graph;
+                };
+
+                // 只有拿到真实可用的锚点矩形才允许显示面板：
+                // 零尺寸（display:none / 尚未布局）或完全滚出视口时一律判定为不可见，
+                // 否则 getBoundingClientRect() 的 0,0 会把面板顶到画布左上角。
+                this.getSidePreviewAnchorRect = () => {
+                    const anchor = this.promptSelectorMainContainer;
+                    if (!anchor?.isConnected) return null;
+                    if (!anchor.getClientRects?.().length) return null;
+                    const rect = anchor.getBoundingClientRect?.();
+                    if (!rect || rect.width <= 20 || rect.height <= 20) return null;
+                    // 不再每帧 getComputedStyle（会强制样式重算）：
+                    // ComfyUI 隐藏 DOM widget 用的就是 display:none，已被上面的 getClientRects() 覆盖
+                    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+                    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+                    const edge = 8;
+                    const onScreen = rect.right > edge && rect.bottom > edge
+                        && rect.left < viewportWidth - edge && rect.top < viewportHeight - edge;
+                    return onScreen ? rect : null;
+                };
+
                 this.isPromptSelectorOverlayOpen = () => Boolean(
-                    document.querySelector(".ps-edit-modal, .ps-library-modal, .ps-category-menu, .ps-context-menu")
+                    queryOwned(".ps-edit-modal, .ps-library-modal, .ps-category-menu, .ps-context-menu")
                 );
 
                 this.getSidePreviewBasePrompt = prompts => {
@@ -1261,7 +1359,10 @@ app.registerExtension({
                 this.ensureSidePreviewDock = () => {
                     if (this.sidePreviewDock?.isConnected) return this.sidePreviewDock;
                     const dock = document.createElement("div");
-                    dock.className = "ps-side-preview-dock";
+                    dock.className = "ps-side-preview-dock hidden";
+                    // 兜底坐标：任何异常情况下都不会出现在 document 左上角
+                    dock.style.left = "-9999px";
+                    dock.style.top = "-9999px";
                     dock.innerHTML = `
                         <button class="ps-side-preview-toggle" type="button" title="${t('collapse_preview')}">
                             <span class="ps-side-preview-toggle-icon">◀</span>
@@ -1276,7 +1377,7 @@ app.registerExtension({
                             </div>
                         </div>
                     `;
-                    document.body.appendChild(dock);
+                    appendFloating(dock);
                     const toggleBtn = dock.querySelector(".ps-side-preview-toggle");
                     toggleBtn?.addEventListener("click", event => {
                         event.preventDefault();
@@ -1319,69 +1420,116 @@ app.registerExtension({
                     titleEl.textContent = current.alias || current.prompt || t('side_preview_title');
                     textEl.textContent = current.prompt || "";
                     if (current.image) {
-                        imageWrap.innerHTML = `<img class="ps-side-preview-image" src="/dtt_prompt_selector/preview/${current.image}?t=${Date.now()}" alt="Preview">`;
+                        setPreviewImage(imageWrap, current.image, "ps-side-preview-image");
                     } else {
                         imageWrap.innerHTML = `<div class="ps-side-preview-empty">${t('side_preview_no_image')}</div>`;
                     }
                 };
 
+                this.hideSidePreviewDock = () => {
+                    const dock = this.sidePreviewDock;
+                    if (!dock) return;
+                    this.sidePreviewDockVisible = false;
+                    this.sidePreviewDockLastLayoutKey = "";
+                    dock.classList.add("hidden");
+                };
+
                 this.updateSidePreviewDockPosition = () => {
                     const dock = this.sidePreviewDock;
-                    const anchor = this.promptSelectorMainContainer;
-                    if (!dock || !anchor?.isConnected) return;
+                    if (!dock) return;
 
-                    const rect = anchor.getBoundingClientRect();
-                    const shouldShow = !this.isPromptSelectorOverlayOpen?.() && (this.isPromptSelectorSelected?.() || this.sidePreviewNodeHover) && rect.width > 20 && rect.height > 20;
-                    if (!shouldShow) {
-                        dock.classList.add("hidden");
+                    const wantsShow = !this.isPromptSelectorOverlayOpen?.()
+                        && (this.isPromptSelectorSelected?.() || this.sidePreviewNodeHover);
+                    const rect = this.getSidePreviewAnchorRect?.();
+                    // 关键修复：必须先把面板隐藏再 return，
+                    // 旧实现直接 return 会让面板停留在上一次坐标（0,0 时就是左上角）。
+                    if (!wantsShow || !rect || !this.isPromptSelectorInActiveCanvas?.()) {
+                        this.hideSidePreviewDock();
                         return;
                     }
 
-                    dock.classList.remove("hidden");
                     const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
                     const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
                     const gap = 12;
+                    const edge = 8;
                     const handleWidth = 28;
                     const bodyWidth = this.sidePreviewCollapsed ? 0 : 332;
                     const dockWidth = handleWidth + bodyWidth;
-                    const preferLeft = rect.left >= dockWidth + gap;
-                    const side = preferLeft ? "left" : "right";
+                    // 位置/尺寸都没变就不要再写 style（省掉每帧的样式失效与重排）
+                    const layoutKey = [
+                        Math.round(rect.left), Math.round(rect.top),
+                        Math.round(rect.width), Math.round(rect.height),
+                        viewportWidth, viewportHeight, dockWidth,
+                    ].join("|");
+                    if (this.sidePreviewDockVisible
+                        && this.sidePreviewDockLastLayoutKey === layoutKey
+                        && !dock.classList.contains("hidden")) {
+                        return;
+                    }
+                    const spaceLeft = rect.left - gap - edge;
+                    const spaceRight = viewportWidth - rect.right - gap - edge;
+                    const side = spaceLeft >= dockWidth
+                        ? "left"
+                        : (spaceRight >= dockWidth ? "right" : (spaceLeft >= spaceRight ? "left" : "right"));
                     dock.classList.toggle("dock-left", side === "left");
                     dock.classList.toggle("dock-right", side === "right");
                     const toggleIcon = dock.querySelector(".ps-side-preview-toggle-icon");
                     if (toggleIcon) {
-                        toggleIcon.textContent = this.sidePreviewCollapsed ? "\u25b6" : (side === "right" ? "\u25b6" : "\u25c0");
+                        toggleIcon.textContent = this.sidePreviewCollapsed ? "▶" : (side === "right" ? "▶" : "◀");
                     }
 
-                    const height = Math.min(Math.max(260, rect.height), Math.max(260, viewportHeight - 16));
-                    const top = Math.max(8, Math.min(rect.top, viewportHeight - height - 8));
-                    let left = side === "left"
-                        ? rect.left - dockWidth - gap
-                        : rect.right + gap;
-                    left = Math.max(8, Math.min(left, viewportWidth - dockWidth - 8));
+                    const height = Math.min(Math.max(260, rect.height), Math.max(260, viewportHeight - edge * 2));
+                    const top = Math.max(edge, Math.min(rect.top, viewportHeight - height - edge));
+                    const maxLeft = Math.max(edge, viewportWidth - dockWidth - edge);
+                    let left = side === "left" ? rect.left - dockWidth - gap : rect.right + gap;
+                    left = Math.max(edge, Math.min(left, maxLeft));
 
-                    dock.style.top = `${top}px`;
-                    dock.style.left = `${left}px`;
-                    dock.style.height = `${height}px`;
+                    // 先写坐标、再去掉 hidden，避免第一帧闪现在左上角
+                    dock.style.top = top + "px";
+                    dock.style.left = left + "px";
+                    dock.style.height = height + "px";
+                    this.sidePreviewDockVisible = true;
+                    this.sidePreviewDockLastLayoutKey = layoutKey;
+                    dock.classList.remove("hidden");
                 };
 
                 this.startSidePreviewDockLoop = () => {
                     if (this.sidePreviewDockRaf) return;
                     const tick = () => {
                         this.sidePreviewDockRaf = 0;
-                        if (this.sidePreviewDock?.isConnected) {
-                            this.updateSidePreviewDockPosition?.();
+                        if (!this.sidePreviewDock?.isConnected) return; // 面板已被移除，彻底停下
+                        // 面板可见时约 30fps；其余降频，用来发现「弹窗关闭 / 取消选中 / 节点滚出视口」
+                        const now = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
+                        const interval = this.sidePreviewDockVisible ? 32 : 150;
+                        if (now - (this.sidePreviewDockLastTick || 0) >= interval) {
+                            this.sidePreviewDockLastTick = now;
+                            try {
+                                this.updateSidePreviewDockPosition?.();
+                            } catch (error) {
+                                console.error("[DanbooruTagToolkit] side preview dock update failed:", error);
+                            }
+                        }
+                        // 节点空闲（未选中、未悬停、面板不可见）时不再排下一帧
+                        const active = this.sidePreviewDockVisible
+                            || this.sidePreviewNodeHover
+                            || this.isPromptSelectorSelected?.();
+                        if (active) {
                             this.sidePreviewDockRaf = window.requestAnimationFrame(tick);
                         }
                     };
                     this.sidePreviewDockRaf = window.requestAnimationFrame(tick);
                 };
 
-                this.destroySidePreviewDock = () => {
+                this.stopSidePreviewDockLoop = () => {
                     if (this.sidePreviewDockRaf) {
                         window.cancelAnimationFrame(this.sidePreviewDockRaf);
                         this.sidePreviewDockRaf = 0;
                     }
+                };
+
+                this.destroySidePreviewDock = () => {
+                    this.stopSidePreviewDockLoop?.();
+                    this.sidePreviewDockLastLayoutKey = "";
                     this.sidePreviewDock?.remove();
                     this.sidePreviewDock = null;
                 };
@@ -1813,7 +1961,7 @@ app.registerExtension({
                         // Instead of re-rendering the whole menu, just find and remove the badge
                         const menu = document.querySelector(".ps-category-menu");
                         if (menu) {
-                            const li = menu.querySelector(`li[data-full-name="${categoryName}"]`);
+                            const li = menu.querySelector(`li[data-full-name="${cssEscapeValue(categoryName)}"]`);
                             if (li) {
                                 const badge = li.querySelector('.ps-category-count');
                                 if (badge) {
@@ -2061,7 +2209,7 @@ app.registerExtension({
 
                     menu.appendChild(searchInput);
                     menu.appendChild(treeContainer);
-                    document.body.appendChild(menu);
+                    appendFloating(menu);
 
                     const rect = button.getBoundingClientRect();
                     menu.style.left = `${rect.left}px`;
@@ -2086,10 +2234,8 @@ app.registerExtension({
 
 
                 this.hideActivePromptsPreview = () => {
-                    const previewBoxes = document.querySelectorAll(".ps-active-prompts-preview");
-                    if (previewBoxes.length > 0) {
-                        previewBoxes.forEach(p => p.remove());
-                    }
+                    // 只移除本节点自己的浮动预览，避免踩到其它节点
+                    queryOwnedAll(".ps-active-prompts-preview").forEach(preview => preview.remove());
                 };
 
                 this.showActivePromptsPreview = (categoryName, targetElement) => {
@@ -2126,7 +2272,14 @@ app.registerExtension({
                             ? '...' + promptInfo.category.substring(categoryName.length)
                             : (promptInfo.category !== categoryName ? `[${promptInfo.category}]` : '');
 
-                        li.innerHTML = `${displayCategory ? `<span class="ps-preview-category">${displayCategory}</span> ` : ''}${promptInfo.text}`;
+                        if (displayCategory) {
+                            const displayCategoryEl = document.createElement("span");
+                            displayCategoryEl.className = "ps-preview-category";
+                            displayCategoryEl.textContent = displayCategory;
+                            li.appendChild(displayCategoryEl);
+                            li.appendChild(document.createTextNode(" "));
+                        }
+                        li.appendChild(document.createTextNode(String(promptInfo.text ?? "")));
                         ul.appendChild(li);
                     });
                     previewBox.appendChild(ul);
@@ -2142,7 +2295,7 @@ app.registerExtension({
                         this.hideActivePromptsPreview();
                     });
 
-                    document.body.appendChild(previewBox);
+                    appendFloating(previewBox);
 
                     const targetRect = targetElement.getBoundingClientRect();
                     const menu = document.querySelector(".ps-category-menu");
@@ -2177,7 +2330,11 @@ app.registerExtension({
                     const ul = document.createElement("ul");
                     allActivePrompts.forEach(promptInfo => {
                         const li = document.createElement("li");
-                        li.innerHTML = `<span class="ps-preview-category">[${promptInfo.category}]</span> ${promptInfo.text}`;
+                        const allCategoryEl = document.createElement("span");
+                        allCategoryEl.className = "ps-preview-category";
+                        allCategoryEl.textContent = "[" + String(promptInfo.category ?? "") + "]";
+                        li.appendChild(allCategoryEl);
+                        li.appendChild(document.createTextNode(" " + String(promptInfo.text ?? "")));
                         ul.appendChild(li);
                     });
                     previewBox.appendChild(ul);
@@ -2192,7 +2349,7 @@ app.registerExtension({
                         this.hideActivePromptsPreview();
                     });
 
-                    document.body.appendChild(previewBox);
+                    appendFloating(previewBox);
 
                     const mainButton = header.querySelector("#ps-category-btn");
                     const anchorElement = targetElement || mainButton;
@@ -2218,26 +2375,15 @@ app.registerExtension({
                             <div class="ps-edit-form-container">
                                 <div class="ps-edit-form-left">
                                     <label>${t('alias')}:</label>
-                                    <input type="text" id="ps-edit-alias" value="${prompt.alias || ''}" placeholder="${t('alias_placeholder')}">
+                                    <input type="text" id="ps-edit-alias" placeholder="${t('alias_placeholder')}">
                                     
                                     <label>${t('full_prompt')}:</label>
-                                    <textarea id="ps-edit-prompt" rows="8" placeholder="${t('full_prompt_placeholder')}">${prompt.prompt || ''}</textarea>
+                                    <textarea id="ps-edit-prompt" rows="8" placeholder="${t('full_prompt_placeholder')}"></textarea>
                                 </div>
                                 <div class="ps-edit-form-right">
                                     <label>${t('preview_image')}:</label>
                                     <div id="ps-image-upload-area" class="ps-image-upload-area">
                                         <div id="ps-preview-container" class="ps-preview-container">
-                                            ${prompt.image ?
-                            `<img src="/dtt_prompt_selector/preview/${prompt.image}?t=${new Date().getTime()}" alt="Preview" class="ps-uploaded-image">` :
-                            `<div class="ps-no-preview">
-                                                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                                                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
-                                                        <circle cx="8.5" cy="8.5" r="1.5"></circle>
-                                                        <polyline points="21 15 16 10 5 21"></polyline>
-                                                    </svg>
-                                                    <p>${t('upload_preview_hint')}</p>
-                                                </div>`
-                        }
                                         </div>
                                         <input type="file" id="ps-image-upload" accept="image/png, image/jpeg, image/webp" style="display: none;">
                                     </div>
@@ -2249,8 +2395,31 @@ app.registerExtension({
                             </div>
                         </div>
                     `;
-                    document.body.appendChild(modal);
+                    appendFloating(modal);
                     this.updateSidePreviewDockPosition?.();
+
+                    // 方案A：用户数据通过 value / textContent / 属性赋值回填
+                    const editAliasInput = modal.querySelector("#ps-edit-alias");
+                    if (editAliasInput) editAliasInput.value = String(prompt.alias ?? "");
+                    const editPromptInput = modal.querySelector("#ps-edit-prompt");
+                    if (editPromptInput) editPromptInput.value = String(prompt.prompt ?? "");
+                    const editPreviewContainer = modal.querySelector("#ps-preview-container");
+                    if (editPreviewContainer) {
+                        if (prompt.image) {
+                            const editPreviewImg = document.createElement("img");
+                            editPreviewImg.className = "ps-uploaded-image";
+                            editPreviewImg.alt = "Preview";
+                            editPreviewImg.src = "/dtt_prompt_selector/preview/" + encodeURIComponent(String(prompt.image)) + "?t=" + Date.now();
+                            editPreviewContainer.replaceChildren(editPreviewImg);
+                        } else {
+                            editPreviewContainer.innerHTML = `<div class="ps-no-preview">` +
+                                `<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">` +
+                                `<rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>` +
+                                `<circle cx="8.5" cy="8.5" r="1.5"></circle>` +
+                                `<polyline points="21 15 16 10 5 21"></polyline>` +
+                                `</svg><p>${t('upload_preview_hint')}</p></div>`;
+                        }
+                    }
 
                     const closeModal = () => {
                         if (promptAutocomplete) {
@@ -2423,45 +2592,13 @@ app.registerExtension({
                     });
                 };
 
-                this.showTooltip = (e, prompt) => {
-                    this.hideTooltip(); // Ensure no multiple tooltips
-                    const tooltip = document.createElement("div");
-                    tooltip.className = "ps-tooltip";
-
-                    let imageHTML = '';
-                    if (prompt.image) {
-                        // 注意：这里的图片路径需要一个方法来解析。暂时假定它可以直接访问。
-                        // 实际应用中可能需要一个API端点来服务图片。
-                        imageHTML = `<img src="/dtt_prompt_selector/preview/${prompt.image}" alt="Preview">`;
-                    }
-
-                    tooltip.innerHTML = `
-                        ${imageHTML}
-                        <strong>${prompt.alias}</strong>
-                        <p>${prompt.prompt}</p>
-                    `;
-                    document.body.appendChild(tooltip);
-
-                    const rect = e.currentTarget.getBoundingClientRect();
-                    tooltip.style.left = `${rect.right + 10}px`;
-                    tooltip.style.top = `${rect.top}px`;
-                };
-
-                this.hideTooltip = () => {
-                    const tooltip = document.querySelector(".ps-tooltip");
-                    if (tooltip) {
-                        tooltip.remove();
-                    }
-                };
 
                 this.showPromptTooltip = (e, prompt) => {
-                    this.hideTooltip?.();
                     this.updatePreviewPanel?.(prompt);
                     this.setSidePreviewPrompt?.(prompt, { hovered: true });
                 };
 
                 this.hidePromptTooltip = () => {
-                    this.hideTooltip?.();
                     if (!this.sidePreviewHoverPrompt) {
                         this.renderSidePreviewDock?.();
                         return;
@@ -2475,8 +2612,9 @@ app.registerExtension({
                 };
 
                 this.showLibraryModal = async () => {
-                    // 防止重复创建
-                    if (document.querySelector(".ps-library-modal")) return;
+                    // 防止重复创建（下面的 await 期间也要拦住，否则双击会开出两个弹窗）
+                    if (this.getLibraryModal() || this.libraryModalOpening) return;
+                    this.libraryModalOpening = true;
 
                     // --- 阶段二: 弹窗打开时主动检查服务器数据更新 ---
                     logger.info("[PromptSelector] 词库弹窗打开,检查服务器数据是否有更新");
@@ -2540,8 +2678,10 @@ app.registerExtension({
                         // 降级策略: 使用本地数据继续打开弹窗
                     }
 
+                    this.libraryModalOpening = false;
                     const modal = document.createElement("div");
                     modal.className = "ps-library-modal";
+                    this.libraryModalEl = modal;
 
                     modal.innerHTML = `
                         <div class="ps-library-content" id="ps-library-content">
@@ -2621,7 +2761,7 @@ app.registerExtension({
                         </div>
                     `;
 
-                    document.body.appendChild(modal);
+                    appendFloating(modal);
                     this.updateSidePreviewDockPosition?.();
                     const previewPanel = modal.querySelector('.ps-library-preview-panel');
                     this.updatePreviewPanel = (prompt = null) => {
@@ -2638,7 +2778,7 @@ app.registerExtension({
                             return;
                         }
                         if (prompt.image) {
-                            imageWrap.innerHTML = `<img src="/dtt_prompt_selector/preview/${prompt.image}?t=${Date.now()}" alt="Preview" class="ps-preview-image">`;
+                            setPreviewImage(imageWrap, prompt.image, "ps-preview-image");
                         } else {
                             imageWrap.innerHTML = `<div class="ps-preview-empty">${t('side_preview_no_image')}</div>`;
                         }
@@ -2670,7 +2810,7 @@ app.registerExtension({
                             if (e.detail.isNew && e.detail.promptId) {
                                 setTimeout(() => {
                                     const container = modal.querySelector('.ps-prompt-list-container');
-                                    const newItem = container.querySelector(`[data-prompt-id="${e.detail.promptId}"]`);
+                                    const newItem = container.querySelector(`[data-prompt-id="${cssEscapeValue(e.detail.promptId)}"]`);
                                     if (newItem) {
                                         newItem.scrollIntoView({ behavior: 'smooth', block: 'end' });
                                         newItem.classList.add('ps-highlight-new');
@@ -2703,6 +2843,7 @@ app.registerExtension({
                         document.removeEventListener('keydown', handleKeydown);
                         document.removeEventListener('ps-data-updated', dataUpdateHandler);
                         document.removeEventListener('ps-data-synced', dataSyncedHandler);
+                        if (this.libraryModalEl === modal) this.libraryModalEl = null;
                         modal.remove();
                     };
                     modal.querySelector("#ps-library-close").addEventListener("click", closeModal);
@@ -2752,7 +2893,7 @@ app.registerExtension({
                     // ⚠️ 修复：不应该强制修改selectedCategory，应该保持原有选中状态
                     if (this.promptData.categories.length > 0) {
                         // ⚠️ 关键修复：data-full-name 在 li 元素上，不在 .ps-tree-item 上
-                        const li = categoryTreeContainer.querySelector(`li[data-full-name="${this.selectedCategory}"]`);
+                        const li = categoryTreeContainer.querySelector(`li[data-full-name="${cssEscapeValue(this.selectedCategory)}"]`);
                         const selectedItem = li ? li.querySelector('.ps-tree-item') : null;
 
                         if (selectedItem) {
@@ -2846,7 +2987,7 @@ app.registerExtension({
 
                             // 恢复选中状态
                             modal.querySelectorAll('.ps-tree-item.selected, .ps-favorites-btn.selected').forEach(el => el.classList.remove('selected'));
-                            const selectedItem = categoryTreeContainer.querySelector(`.ps-tree-item[data-full-name="${this.selectedCategory}"]`);
+                            const selectedItem = categoryTreeContainer.querySelector(`.ps-tree-item[data-full-name="${cssEscapeValue(this.selectedCategory)}"]`);
                             if (selectedItem) {
                                 selectedItem.classList.add('selected');
                                 let parentLi = selectedItem.closest('li.parent');
@@ -2863,9 +3004,8 @@ app.registerExtension({
                     // --- 新增的事件监听器 ---
 
 
-
                     this.updateBatchControlsVisibility = () => {
-                        const modal = document.querySelector('.ps-library-modal');
+                        const modal = this.getLibraryModal();
                         if (!modal) return;
                         const defaultControls = modal.querySelector('.ps-default-controls');
                         const batchControls = modal.querySelector('.ps-batch-controls');
@@ -3107,8 +3247,6 @@ app.registerExtension({
                 };
 
 
-
-
                 this.showSettingsModal = () => {
                     if (document.querySelector(".ps-settings-modal")) return;
 
@@ -3153,7 +3291,7 @@ app.registerExtension({
                             </div>
                         </div>
                     `;
-                    document.body.appendChild(modal);
+                    appendFloating(modal);
                     this.updateSidePreviewDockPosition?.();
 
                     // --- Logic ---
@@ -3219,7 +3357,7 @@ app.registerExtension({
                     logger.info(`[PromptSelector] refreshLibraryModal 被调用 (节点ID: ${this.id}, 当前分类: "${this.selectedCategory}")`);
 
                     // 检查词库弹窗是否已打开
-                    const modal = document.querySelector('.ps-library-modal');
+                    const modal = this.getLibraryModal();
                     if (!modal) {
                         logger.info("[PromptSelector] 词库弹窗未打开,跳过UI刷新");
                         return;
@@ -3253,7 +3391,7 @@ app.registerExtension({
                     if (categoryExists) {
                         // 分类存在，在DOM中恢复选中状态
                         // ⚠️ 修复：data-full-name 在 li 元素上，而不是 .ps-tree-item 上
-                        const li = categoryTreeContainer.querySelector(`li[data-full-name="${this.selectedCategory}"]`);
+                        const li = categoryTreeContainer.querySelector(`li[data-full-name="${cssEscapeValue(this.selectedCategory)}"]`);
                         const selectedItem = li ? li.querySelector('.ps-tree-item') : null;
 
                         if (selectedItem) {
@@ -3280,7 +3418,7 @@ app.registerExtension({
 
                         // 如果 selectedCategory 仍然有值，尝试在DOM中找到并选中
                         if (this.selectedCategory) {
-                            const li = categoryTreeContainer.querySelector(`li[data-full-name="${this.selectedCategory}"]`);
+                            const li = categoryTreeContainer.querySelector(`li[data-full-name="${cssEscapeValue(this.selectedCategory)}"]`);
                             const selectedItem = li ? li.querySelector('.ps-tree-item') : null;
                             if (selectedItem) {
                                 selectedItem.classList.add('selected');
@@ -3348,7 +3486,7 @@ app.registerExtension({
                             }));
 
                             // 重新渲染列表
-                            const modal = document.querySelector('.ps-library-modal');
+                            const modal = this.getLibraryModal();
                             if (modal) {
                                 this.renderPromptList(this.selectedCategory);
                             }
@@ -3404,7 +3542,7 @@ app.registerExtension({
                             }));
 
                             // 重新渲染列表
-                            const modal = document.querySelector('.ps-library-modal');
+                            const modal = this.getLibraryModal();
                             if (modal) {
                                 this.renderPromptList(this.selectedCategory);
                             }
@@ -3485,7 +3623,7 @@ app.registerExtension({
                         </ul>
                     `;
 
-                    document.body.appendChild(menu);
+                    appendFloating(menu);
 
                     menu.querySelector('#ps-context-add-sub').addEventListener('click', () => {
                         this.showInputModal(t('create_subcategory'), t('subcategory_prompt'), '', (subName) => {
@@ -3503,7 +3641,7 @@ app.registerExtension({
                             this.promptData.categories.push(newCategory);
                             this.saveData();
                             // Refresh tree
-                            const modal = document.querySelector('.ps-library-modal');
+                            const modal = this.getLibraryModal();
                             if (modal) {
                                 const categoryTreeContainer = modal.querySelector('.ps-category-tree');
                                 const categoryTree = this.buildCategoryTree(this.promptData.categories);
@@ -3513,7 +3651,7 @@ app.registerExtension({
 
                                 // 恢复选中状态
                                 modal.querySelectorAll('.ps-tree-item.selected, .ps-favorites-btn.selected').forEach(el => el.classList.remove('selected'));
-                                const selectedItem = categoryTreeContainer.querySelector(`.ps-tree-item[data-full-name="${this.selectedCategory}"]`);
+                                const selectedItem = categoryTreeContainer.querySelector(`.ps-tree-item[data-full-name="${cssEscapeValue(this.selectedCategory)}"]`);
                                 if (selectedItem) {
                                     selectedItem.classList.add('selected');
                                     let parentLi = selectedItem.closest('li.parent');
@@ -3610,7 +3748,7 @@ app.registerExtension({
 
                             this.showToast(t('update_prompt_success'));
 
-                            const modal = document.querySelector('.ps-library-modal');
+                            const modal = this.getLibraryModal();
                             if (modal) {
                                 const categoryTreeContainer = modal.querySelector('.ps-category-tree');
                                 const categoryTree = this.buildCategoryTree(this.promptData.categories);
@@ -3618,7 +3756,7 @@ app.registerExtension({
                                 categoryTreeContainer.innerHTML = '';
                                 categoryTreeContainer.appendChild(treeElement);
 
-                                const newSelectedItem = categoryTreeContainer.querySelector(`.ps-tree-item[data-full-name="${this.selectedCategory}"]`);
+                                const newSelectedItem = categoryTreeContainer.querySelector(`.ps-tree-item[data-full-name="${cssEscapeValue(this.selectedCategory)}"]`);
                                 if (newSelectedItem) {
                                     newSelectedItem.classList.add('selected');
                                     let parentLi = newSelectedItem.closest('li.parent');
@@ -3709,7 +3847,7 @@ app.registerExtension({
                             }));
 
                             // Refresh UI
-                            const modal = document.querySelector('.ps-library-modal');
+                            const modal = this.getLibraryModal();
                             if (modal) {
                                 const categoryTreeContainer = modal.querySelector('.ps-category-tree');
                                 const categoryTree = this.buildCategoryTree(this.promptData.categories);
@@ -3719,7 +3857,7 @@ app.registerExtension({
 
                                 modal.querySelectorAll('.ps-tree-item.selected').forEach(el => el.classList.remove('selected'));
                                 // ⚠️ 修复：data-full-name 在 li 元素上
-                                const li = categoryTreeContainer.querySelector(`li[data-full-name="${this.selectedCategory}"]`);
+                                const li = categoryTreeContainer.querySelector(`li[data-full-name="${cssEscapeValue(this.selectedCategory)}"]`);
                                 const selectedItem = li ? li.querySelector('.ps-tree-item') : null;
                                 if (selectedItem) {
                                     selectedItem.classList.add('selected');
@@ -3786,7 +3924,7 @@ app.registerExtension({
                                 }));
 
                                 this.showToast(t('clear_category_success'));
-                                const modal = document.querySelector('.ps-library-modal');
+                                const modal = this.getLibraryModal();
                                 if (modal && this.selectedCategory === categoryName) {
                                     this.renderPromptList(categoryName);
                                 }
@@ -3805,17 +3943,25 @@ app.registerExtension({
                     modal.className = "ps-edit-modal ps-input-modal";
                     modal.innerHTML = `
                         <div class="ps-modal-content" style="width: 450px; max-width: 90vw;">
-                            <h3>${title}</h3>
-                            <label>${message}</label>
-                            <input type="text" id="ps-input-value" value="${defaultValue || ''}">
+                            <h3></h3>
+                            <label></label>
+                            <input type="text" id="ps-input-value" value="">
                             <div class="ps-modal-buttons">
                                 <button id="ps-input-confirm">${t('save')}</button>
                                 <button id="ps-input-cancel">${t('cancel')}</button>
                             </div>
                         </div>
                     `;
-                    document.body.appendChild(modal);
+                    appendFloating(modal);
                     this.updateSidePreviewDockPosition?.();
+
+                    // 方案A：标题/说明/默认值都用 textContent / value 回填
+                    const inputTitleEl = modal.querySelector("h3");
+                    if (inputTitleEl) inputTitleEl.textContent = String(title ?? "");
+                    const inputLabelEl = modal.querySelector("label");
+                    if (inputLabelEl) inputLabelEl.textContent = String(message ?? "");
+                    const inputValueEl = modal.querySelector("#ps-input-value");
+                    if (inputValueEl) inputValueEl.value = String(defaultValue ?? "");
 
                     const input = modal.querySelector("#ps-input-value");
                     input.focus();
@@ -3843,7 +3989,7 @@ app.registerExtension({
                 };
 
                 this.updateBatchControls = () => {
-                    const modal = document.querySelector('.ps-library-modal');
+                    const modal = this.getLibraryModal();
                     if (!modal || !this.batchMode) return;
 
                     const deleteBtn = modal.querySelector('#ps-batch-delete-btn');
@@ -3963,7 +4109,7 @@ app.registerExtension({
                                 // ⚠️ 关键修复：只处理左键点击，避免右键点击时修改selectedCategory
                                 if (e.button !== 0) return; // 0 = 左键，2 = 右键
 
-                                const modal = document.querySelector('.ps-library-modal');
+                                const modal = this.getLibraryModal();
                                 if (!modal) return;
 
                                 if (li.classList.contains('parent')) {
@@ -3996,7 +4142,7 @@ app.registerExtension({
                 };
 
                 this.renderPromptList = (categoryName, searchTerm = '', skipSort = false) => {
-                    const modal = document.querySelector('.ps-library-modal');
+                    const modal = this.getLibraryModal();
                     if (!modal) return;
                     const promptListContainer = modal.querySelector('.ps-prompt-list-container');
                     if (!promptListContainer) return;
@@ -4091,30 +4237,54 @@ app.registerExtension({
 
 
                         item.innerHTML = `
-                            ${this.batchMode ? `<div class="ps-batch-checkbox-wrapper"><input type="checkbox" class="ps-batch-checkbox" data-prompt-id="${p.id}"></div>` : ''}
+                            ${this.batchMode ? `<div class="ps-batch-checkbox-wrapper"><input type="checkbox" class="ps-batch-checkbox"></div>` : ''}
                             <div class="ps-prompt-content">
                                 <div class="ps-prompt-list-item-header">
-                                    <div class="ps-prompt-list-item-name">${p.favorite ? '<span class="ps-favorite-star">⭐</span>' : ''}${p.alias}</div>
-                                    ${showCategoryTag ? `<span class="ps-subcategory-tag">${subCategoryName}</span>` : ''}
+                                    <div class="ps-prompt-list-item-name"></div>
+                                    ${showCategoryTag ? `<span class="ps-subcategory-tag"></span>` : ''}
                                 </div>
-                                <div class="ps-prompt-list-item-preview">${p.prompt}</div>
-                                ${p.description ? `<div class="ps-prompt-description">${p.description}</div>` : ''}
+                                <div class="ps-prompt-list-item-preview"></div>
+                                ${p.description ? `<div class="ps-prompt-description"></div>` : ''}
                             </div>
                             <div class="ps-prompt-item-controls">
-                                <button class="ps-btn ps-btn-icon ps-favorite-btn ${favoriteClass}" title="${t('mark_favorite')}" data-prompt-id="${p.id}">
+                                <button class="ps-btn ps-btn-icon ps-favorite-btn ${favoriteClass}" title="${t('mark_favorite')}">
                                     <svg viewBox="0 0 24 24"><polygon points="12,2 15.09,8.26 22,9.27 17,14.14 18.18,21.02 12,17.77 5.82,21.02 7,14.14 2,9.27 8.91,8.26"></polygon></svg>
                                 </button>
-                                <button class="ps-btn ps-btn-icon ps-copy-btn" title="${t('copy_prompt')}" data-prompt-id="${p.id}">
+                                <button class="ps-btn ps-btn-icon ps-copy-btn" title="${t('copy_prompt')}">
                                     <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
                                 </button>
-                                <button class="ps-btn ps-btn-icon ps-edit-btn" title="${t('edit_prompt')}" data-prompt-id="${p.id}">
+                                <button class="ps-btn ps-btn-icon ps-edit-btn" title="${t('edit_prompt')}">
                                     <svg viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
                                 </button>
-                                <button class="ps-btn ps-btn-icon ps-delete-btn" title="${t('delete_prompt_confirm', { prompt: p.alias })}" data-prompt-id="${p.id}">
+                                <button class="ps-btn ps-btn-icon ps-delete-btn" title="${t('delete_prompt_confirm')}">
                                     <svg viewBox="0 0 24 24"><polyline points="3,6 5,6 21,6"></polyline><path d="M19,6v14a2,2,0,0,1-2,2H7a2,2,0,0,1-2-2V6m3,0V4a2,2,0,0,1,2-2h4a2,2,0,0,1,2,2V6"></path></svg>
                                 </button>
                             </div>
                         `;
+                        // 方案A：用户数据一律走 textContent / dataset，不再拼进 HTML 字符串
+                        const promptNameEl = item.querySelector(".ps-prompt-list-item-name");
+                        if (promptNameEl) {
+                            if (p.favorite) {
+                                const starEl = document.createElement("span");
+                                starEl.className = "ps-favorite-star";
+                                starEl.textContent = "⭐";
+                                promptNameEl.appendChild(starEl);
+                            }
+                            promptNameEl.appendChild(document.createTextNode(String(p.alias ?? "")));
+                        }
+                        const subcategoryEl = item.querySelector(".ps-subcategory-tag");
+                        if (subcategoryEl) subcategoryEl.textContent = String(subCategoryName ?? "");
+                        const promptPreviewEl = item.querySelector(".ps-prompt-list-item-preview");
+                        if (promptPreviewEl) promptPreviewEl.textContent = String(p.prompt ?? "");
+                        const promptDescEl = item.querySelector(".ps-prompt-description");
+                        if (promptDescEl) promptDescEl.textContent = String(p.description ?? "");
+                        item.querySelectorAll(".ps-prompt-item-controls button").forEach(button => {
+                            button.dataset.promptId = String(p.id ?? "");
+                        });
+                        const batchCheckboxEl = item.querySelector(".ps-batch-checkbox");
+                        if (batchCheckboxEl) batchCheckboxEl.dataset.promptId = String(p.id ?? "");
+                        const deletePromptBtn = item.querySelector(".ps-delete-btn");
+                        if (deletePromptBtn) deletePromptBtn.title = t('delete_prompt_confirm', { prompt: p.alias });
 
                         // 拖拽事件
                         if (isSingleCategoryView) {
@@ -4177,7 +4347,7 @@ app.registerExtension({
                             });
                         }
 
-                        // 悬浮预览
+                        // 悬浮预览（同一块重复绑定了两次，去重）
                         item.addEventListener('mouseenter', (e) => {
                             this.showPromptTooltip(e, p);
                         });
@@ -4185,13 +4355,6 @@ app.registerExtension({
                             this.hidePromptTooltip();
                         });
 
-                        // 悬浮预览
-                        item.addEventListener('mouseenter', (e) => {
-                            this.showPromptTooltip(e, p);
-                        });
-                        item.addEventListener('mouseleave', (e) => {
-                            this.hidePromptTooltip();
-                        });
 
                         // 单击加载提示词或切换选择
                         item.addEventListener('click', (e) => {
@@ -4208,7 +4371,7 @@ app.registerExtension({
                                 }
                             } else {
                                 this.loadPrompt(p);
-                                const libraryModal = document.querySelector('.ps-library-modal');
+                                const libraryModal = this.getLibraryModal();
                                 if (libraryModal) libraryModal.querySelector("#ps-library-close").click();
                             }
                         });
@@ -4355,8 +4518,16 @@ app.registerExtension({
                         const deltaX = e.clientX - startX;
                         const deltaY = e.clientY - startY;
 
-                        const newLeft = Math.max(0, Math.min(window.innerWidth - element.offsetWidth, startLeft + deltaX));
-                        const newTop = Math.max(0, Math.min(window.innerHeight - element.offsetHeight, startTop + deltaY));
+                        // 弹窗比视口还大时，允许拖到负偏移（否则右/下部分永远看不到，
+                        // 而且会被 Math.max(0, ...) 直接钉在 0 位置）
+                        const dragWidth = element.offsetWidth || 0;
+                        const dragHeight = element.offsetHeight || 0;
+                        const minLeft = Math.min(0, window.innerWidth - dragWidth);
+                        const minTop = Math.min(0, window.innerHeight - dragHeight);
+                        const maxLeft = Math.max(0, window.innerWidth - dragWidth);
+                        const maxTop = Math.max(0, window.innerHeight - dragHeight);
+                        const newLeft = Math.min(maxLeft, Math.max(minLeft, startLeft + deltaX));
+                        const newTop = Math.min(maxTop, Math.max(minTop, startTop + deltaY));
 
                         element.style.left = newLeft + 'px';
                         element.style.top = newTop + 'px';
@@ -4372,15 +4543,6 @@ app.registerExtension({
                     handle.style.cursor = 'move';
                 };
 
-                // 添加加载状态管理
-                this.showLoadingState = (container, message = '加载中...') => {
-                    container.innerHTML = `
-                        <div class="ps-loading-container">
-                            <div class="ps-loading-spinner"></div>
-                            <span class="ps-loading-text">${message}</span>
-                        </div>
-                    `;
-                };
 
                 // 添加按钮加载状态
                 this.setButtonLoading = (button, loading = true) => {
@@ -4408,7 +4570,11 @@ app.registerExtension({
 
                     const reader = new FileReader();
                     reader.onload = (event) => {
-                        previewContainer.innerHTML = `<img src="${event.target.result}" alt="Preview" class="ps-uploaded-image">`;
+                        const uploadedPreviewImg = document.createElement("img");
+                        uploadedPreviewImg.className = "ps-uploaded-image";
+                        uploadedPreviewImg.alt = "Preview";
+                        uploadedPreviewImg.src = String(event.target.result ?? "");
+                        previewContainer.replaceChildren(uploadedPreviewImg);
                         if (callback) callback(file);
                     };
                     reader.onerror = () => {
@@ -4438,15 +4604,19 @@ app.registerExtension({
                     modal.innerHTML = `
                        <div class="ps-modal-content" style="width: 400px; max-width: 90vw;">
                             <h3>${t('confirm_action')}</h3>
-                            <p>${message}</p>
+                            <p></p>
                             <div class="ps-modal-buttons">
                                <button id="ps-confirm-ok">${t('confirm')}</button>
                                <button id="ps-confirm-cancel">${t('cancel')}</button>
                            </div>
                        </div>
                    `;
-                    document.body.appendChild(modal);
+                    appendFloating(modal);
                     this.updateSidePreviewDockPosition?.();
+
+                    // 方案A：确认文案（可能内嵌分类名/提示词名）用 textContent 回填
+                    const confirmMessageEl = modal.querySelector("p");
+                    if (confirmMessageEl) confirmMessageEl.textContent = String(message ?? "");
 
                     const closeModal = () => modal.remove();
 
@@ -4538,7 +4708,7 @@ app.registerExtension({
                             </div>
                         </div>
                     `;
-                    document.body.appendChild(modal);
+                    appendFloating(modal);
                     this.updateSidePreviewDockPosition?.();
 
                     const treeContainer = modal.querySelector(".ps-category-tree");
@@ -4629,7 +4799,7 @@ app.registerExtension({
                             </div>
                         </div>
                     `;
-                    document.body.appendChild(modal);
+                    appendFloating(modal);
                     this.updateSidePreviewDockPosition?.();
 
                     const listContainer = modal.querySelector(".ps-import-list-container");
@@ -4719,7 +4889,7 @@ app.registerExtension({
                                 this.renderContent();
                                 updateUIText(this);
 
-                                const libraryModal = document.querySelector('.ps-library-modal');
+                                const libraryModal = this.getLibraryModal();
                                 if (libraryModal) {
                                     const categoryTreeContainer = libraryModal.querySelector('.ps-category-tree');
                                     const categoryTree = this.buildCategoryTree(this.promptData.categories);
@@ -4758,10 +4928,20 @@ app.registerExtension({
                 this.destroySidePreviewDock?.();
 
                 // 移除可能打开的菜单或模态框
-                const elementsToRemove = document.querySelectorAll(
-                    ".ps-category-menu, .ps-edit-modal, .ps-library-modal, .ps-context-menu"
-                );
-                elementsToRemove.forEach(el => el.remove());
+                // 只移除属于本节点的悬浮元素：以前会顺带删掉其它节点打开的弹窗/菜单
+                const ownerToken = this.dttOwnerToken;
+                if (ownerToken) {
+                    const floatingSelector = [
+                        ".ps-category-menu",
+                        ".ps-edit-modal",
+                        ".ps-library-modal",
+                        ".ps-context-menu",
+                        ".ps-active-prompts-preview",
+                        ".ps-side-preview-dock",
+                    ].map(sel => `${sel}[data-dtt-owner="${ownerToken}"]`).join(",");
+                    document.querySelectorAll(floatingSelector).forEach(el => el.remove());
+                }
+                this.sidePreviewDock = null;
 
                 onRemoved?.apply(this, arguments);
 
@@ -5108,8 +5288,6 @@ app.registerExtension({
                         height: 18px;
                     }
 
-                    /* Tooltip Styles */
-                    .ps-tooltip strong { color: var(--ps-theme-color-secondary); }
 
                     /* Custom Category Menu */
                     .ps-category-menu {
@@ -6003,25 +6181,6 @@ app.registerExtension({
                        z-index: 1;
                    }
 
-                   /* 加载状态样式 */
-                   .ps-loading-container {
-                       display: flex;
-                       flex-direction: column;
-                       align-items: center;
-                       justify-content: center;
-                       padding: 40px;
-                       color: #ccc;
-                   }
-
-                   .ps-loading-spinner {
-                       width: 40px;
-                       height: 40px;
-                       border: 3px solid #444;
-                       border-top: 3px solid var(--ps-theme-color-secondary);
-                       border-radius: 50%;
-                       animation: ps-spin 1s linear infinite;
-                       margin-bottom: 15px;
-                   }
 
                    .ps-loading-spinner-sm {
                        width: 16px;
@@ -6044,10 +6203,6 @@ app.registerExtension({
                        100% { transform: rotate(360deg); }
                    }
 
-                   .ps-loading-text {
-                       font-size: 14px;
-                       color: #888;
-                   }
 
                    /* 动画和过渡效果 */
                    .ps-library-modal {
@@ -6329,48 +6484,6 @@ app.registerExtension({
                        border-color: var(--ps-theme-color-secondary);
                    }
 
-                   /* 工具提示增强 */
-                   .ps-tooltip {
-                       position: absolute;
-                       background-color: #2a2a2a;
-                       border: 1px solid #444;
-                       border-radius: 8px;
-                       padding: 12px;
-                       box-shadow: 0 8px 24px rgba(0,0,0,0.4);
-                       z-index: 1001;
-                       max-width: 300px;
-                       animation: ps-tooltip-fade-in 0.2s ease-out;
-                   }
-
-                   @keyframes ps-tooltip-fade-in {
-                       from {
-                           opacity: 0;
-                           transform: translateY(10px);
-                       }
-                       to {
-                           opacity: 1;
-                           transform: translateY(0);
-                       }
-                   }
-
-                   .ps-tooltip img {
-                       max-width: 100%;
-                       border-radius: 4px;
-                       margin-bottom: 8px;
-                   }
-
-                   .ps-tooltip strong {
-                       display: block;
-                       margin-bottom: 4px;
-                       color: var(--ps-theme-color-secondary);
-                   }
-
-                   .ps-tooltip p {
-                       margin: 0;
-                       color: #ccc;
-                       font-size: 13px;
-                       line-height: 1.4;
-                   }
 
                    /* New Prompt Tooltip */
                    .ps-library-left-panel {
@@ -6450,70 +6563,6 @@ app.registerExtension({
                            min-width: 0;
                            max-height: 320px;
                        }
-                   }
-                   .ps-prompt-tooltip {
-                       position: fixed;
-                       background-color: #181818;
-                       border: 1px solid #555;
-                       color: #eee;
-                       padding: 0;
-                       border-radius: 8px;
-                       z-index: 1005; /* High z-index */
-                       font-size: 13px;
-                       max-width: 500px;
-                       word-wrap: break-word;
-                       pointer-events: none; /* Prevent tooltip from blocking mouse events */
-                       animation: ps-tooltip-fade-in 0.15s ease-out;
-                       box-shadow: 0 5px 15px rgba(0,0,0,0.5);
-                       display: flex;
-                   }
-                   .ps-tooltip-content {
-                       display: flex;
-                       flex-direction: row;
-                       align-items: flex-start;
-                       padding: 10px;
-                       gap: 10px;
-                   }
-                   .ps-tooltip-image-container {
-                       flex-shrink: 0;
-                       width: 150px;
-                       max-width: 150px;
-                       max-height: 200px;
-                       overflow: hidden;
-                       display: flex;
-                       align-items: center;
-                       justify-content: center;
-                   }
-                   .ps-prompt-tooltip img {
-                       max-width: 100%;
-                       max-height: 100%;
-                       object-fit: contain;
-                       border-radius: 4px;
-                       margin-bottom: 0;
-                   }
-                   .ps-tooltip-text-container {
-                       flex-grow: 1;
-                       min-width: 0;
-                       border: 1px solid #444;
-                       padding: 8px;
-                       border-radius: 4px;
-                       background-color: #222;
-                   }
-                   .ps-prompt-tooltip p {
-                       margin: 0;
-                       line-height: 1.4;
-                   }
-                   .ps-tooltip-no-preview {
-                       width: 150px;
-                       height: 150px;
-                       background-color: #222;
-                       display: flex;
-                       align-items: center;
-                       justify-content: center;
-                       color: #777;
-                       font-size: 16px;
-                       border-radius: 4px;
-                       margin-bottom: 0;
                    }
 
                    /* 滚动条美化 */
