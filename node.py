@@ -8,9 +8,12 @@ import pickle
 import re
 import io
 import time
+import asyncio
+import threading
 import html
 import urllib.parse
 import urllib.request
+import urllib.error
 import torch
 import comfy
 import numpy as np
@@ -38,6 +41,116 @@ _GALLERY_IMAGE_CACHE_LIMIT = 24
 _GALLERY_OUTPUT_SELECTION_LIMIT = 0
 _GALLERY_AUTOCOMPLETE_CACHE_TTL = 300
 _GALLERY_AUTOCOMPLETE_CACHE_LIMIT = 256
+_MAX_GALLERY_IMAGE_BYTES = 32 * 1024 * 1024
+_GALLERY_IMAGE_CACHE_MAX_BYTES = 256 * 1024 * 1024
+_LATEST_BUNDLE_CACHE_LIMIT = 64
+
+
+async def _put_stream_item(queue: "asyncio.Queue", item, timeout: float = 10.0) -> None:
+    """把数据放进有界队列；客户端断开时队列会满，超时即放弃，避免线程卡死。"""
+    await asyncio.wait_for(queue.put(item), timeout=timeout)
+
+
+async def _drain_stream_queue(queue: "asyncio.Queue") -> None:
+    """丢弃队列内容直到生产者收尾，用来给卡在 put 的生产者线程解围。"""
+    while True:
+        kind, _ = await queue.get()
+        if kind in ("end", "error"):
+            return
+
+
+async def _stream_gallery_image(request, url: str, timeout: int = 20):
+    """流式转发图库图片：内存占用只跟分块大小有关，不再整张图 read() 进内存。"""
+    loop = asyncio.get_running_loop()
+    queue: "asyncio.Queue" = asyncio.Queue(maxsize=8)
+    stop_event = threading.Event()
+
+    def produce() -> None:
+        try:
+            with _open_danbooru_url(url, timeout=timeout) as upstream:
+                content_type = str(upstream.headers.get("Content-Type", "application/octet-stream"))
+                try:
+                    content_length = int(upstream.headers.get("Content-Length") or 0)
+                except (TypeError, ValueError):
+                    content_length = 0
+                asyncio.run_coroutine_threadsafe(
+                    _put_stream_item(queue, ("meta", (content_type, content_length))), loop
+                ).result()
+                sent = 0
+                while not stop_event.is_set():
+                    chunk = upstream.read(256 * 1024)
+                    if not chunk:
+                        break
+                    sent += len(chunk)
+                    if sent > _MAX_GALLERY_IMAGE_BYTES:
+                        raise ValueError("gallery image too large")
+                    asyncio.run_coroutine_threadsafe(
+                        _put_stream_item(queue, ("data", chunk)), loop
+                    ).result()
+            asyncio.run_coroutine_threadsafe(_put_stream_item(queue, ("end", None)), loop).result()
+        except Exception as exc:  # noqa: BLE001 - 只能把错误信息传回事件循环
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    _put_stream_item(queue, ("error", str(exc))), loop
+                ).result()
+            except Exception:
+                pass
+
+    loop.run_in_executor(None, produce)
+
+    kind, payload = await queue.get()
+    if kind == "error":
+        return web.json_response({"status": "error", "message": str(payload)}, status=502)
+
+    content_type, content_length = payload if isinstance(payload, tuple) else (payload, 0)
+    if content_length and content_length > _MAX_GALLERY_IMAGE_BYTES:
+        stop_event.set()
+        try:
+            await asyncio.wait_for(_drain_stream_queue(queue), timeout=5)
+        except Exception:
+            pass
+        return web.json_response({"status": "error", "message": "gallery image too large"}, status=502)
+
+    safe_content_type = str(content_type).split(";", 1)[0].strip().lower()
+    if not safe_content_type.startswith("image/"):
+        safe_content_type = "application/octet-stream"
+
+    headers = {
+        "Content-Type": safe_content_type,
+        "Cache-Control": "public, max-age=300",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if content_length > 0:
+        headers["Content-Length"] = str(content_length)
+
+    response = web.StreamResponse(status=200, headers=headers)
+    await response.prepare(request)
+
+    finished = False
+    try:
+        while True:
+            kind, payload = await queue.get()
+            if kind == "data":
+                await response.write(payload)
+            elif kind == "end":
+                finished = True
+                break
+            else:  # 上游中途出错，响应已经开始，只能断开
+                break
+        if finished:
+            await response.write_eof()
+    except Exception as exc:  # 客户端断开等
+        print(f"[DanbooruTagToolkit] gallery image stream aborted: {exc}")
+    finally:
+        if not finished:
+            stop_event.set()
+            try:
+                await asyncio.wait_for(_drain_stream_queue(queue), timeout=10)
+            except Exception:
+                pass
+    return response
+
+
 SEPARATOR_OPTIONS = ["comma", "newline", "space", True, False, "True", "False", "true", "false"]
 _SORTER_PRESET_DIR_NAME = "sorter_presets"
 _TAG_DATABASE_CACHE_DIR_NAME = ".tag_db_cache"
@@ -1547,12 +1660,87 @@ def _is_allowed_gallery_remote_url(raw_url: Any) -> bool:
     return host == "donmai.us" or host.endswith(".donmai.us")
 
 
-def _open_danbooru_url(url: str, timeout: int = 15):
+_DANBOORU_USER_AGENT = (
+    "ComfyUI-Danbooru-Tag-Toolkit/1.0 "
+    "(+https://github.com/Yukinoshita-Yukinoe/ComfyUI-Danbooru-Tag-Toolkit)"
+)
+# 匿名 API 有限流：画师识别这类"连打"的请求共用一把锁 + 最小间隔
+_DANBOORU_MIN_REQUEST_INTERVAL = 1.0
+_danbooru_request_lock = threading.Lock()
+_danbooru_last_request_ts = 0.0
+
+# 自定义 User-Agent 一旦被 Cloudflare 拦（403），本进程内不再带它重试，省掉每次的 403 往返
+_UA_REJECTED_BY_403 = False
+
+
+def _danbooru_throttle() -> None:
+    """所有 Danbooru API 请求共用：串行 + 最小间隔，避免被限流/临时封禁。"""
+    global _danbooru_last_request_ts
+    with _danbooru_request_lock:
+        wait = _DANBOORU_MIN_REQUEST_INTERVAL - (time.time() - _danbooru_last_request_ts)
+        if wait > 0:
+            time.sleep(wait)
+        _danbooru_last_request_ts = time.time()
+
+
+def _danbooru_user_agent() -> str:
+    """可用环境变量 DTT_DANBOORU_USER_AGENT 覆盖；设为空串则完全不发自定义头。"""
+    override = os.environ.get("DTT_DANBOORU_USER_AGENT")
+    if override is not None:
+        return override.strip()
+    return _DANBOORU_USER_AGENT
+
+
+def _describe_danbooru_http_error(exc: Exception) -> str:
+    """把 HTTP 错误翻译成能看懂的提示（403 多半是 Cloudflare 限流/风控）。"""
+    code = getattr(exc, "code", None)
+    reason = getattr(exc, "reason", "")
+    body = ""
+    try:
+        raw_body = exc.read(4096) if hasattr(exc, "read") else b""
+        body = raw_body.decode("utf-8", errors="replace") if isinstance(raw_body, (bytes, bytearray)) else str(raw_body)
+    except Exception:
+        body = ""
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", body)).strip()
+    lowered = text.lower()
+    if code == 403 and ("1015" in text or "rate limit" in lowered or "blocked" in lowered or "cloudflare" in lowered):
+        return ("HTTP 403: Danbooru/Cloudflare 临时限流或拦截了这次请求，等几分钟再试"
+                "（匿名 API 请求过密会触发）")
+    if code == 403:
+        return "HTTP 403: Danbooru 拒绝了这次请求（通常是临时限流或风控）"
+    if text:
+        return f"HTTP {code or '?'}: {text[:220]}"
+    return f"HTTP {code or '?'}: {reason or exc}"
+
+
+def _open_danbooru_url(url: str, timeout: int = 15, throttle: bool = False):
+    """打开 Danbooru 链接。
+
+    throttle=True 时先走全局节流（API 用，图片不节流）。
+    默认带自定义 User-Agent；若被 Cloudflare 以 403 拦下，会自动退回"不带自定义头"的
+    请求再试一次（部分网络环境下自定义 UA 反而更容易被风控）。
+    """
+    global _UA_REJECTED_BY_403
     final_url = _absolutize_danbooru_url(url)
-    return urllib.request.urlopen(final_url, timeout=timeout)
-
-
+    if throttle:
+        _danbooru_throttle()
+    user_agent = "" if _UA_REJECTED_BY_403 else _danbooru_user_agent()
+    if not user_agent:
+        return urllib.request.urlopen(final_url, timeout=timeout)
+    request = urllib.request.Request(final_url, headers={
+        "User-Agent": user_agent,
+        "Accept": "application/json, image/*;q=0.8, */*;q=0.5",
+    })
+    try:
+        return urllib.request.urlopen(request, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 403:
+            raise
+        _UA_REJECTED_BY_403 = True
+        print("[DanbooruTagToolkit] custom User-Agent got HTTP 403; disabling it for this session")
+        return urllib.request.urlopen(final_url, timeout=timeout)
 def _tag_string_to_prompt(tag_string: Any) -> str:
+    """Danbooru 的 tag_string 转成逗号分隔的提示词文本。"""
     tokens = [t.strip() for t in str(tag_string or "").split(" ") if t.strip()]
     if not tokens:
         return ""
@@ -1593,9 +1781,138 @@ def _cleanup_expired_cache_items(cache_dict: Dict[str, Any], ttl_seconds: int):
         cache_dict.pop(key, None)
 
 
+_ALLOWED_GALLERY_IMAGE_EXT = {"jpg", "jpeg", "png", "webp", "bmp", "tiff", "tif"}
+# 图片/视频直链不可能是画师主页，拿去 artists?url_matches 反而会撞出莫名其妙的命中
+_MEDIA_URL_EXTENSIONS = _ALLOWED_GALLERY_IMAGE_EXT | {"gif", "mp4", "webm", "avif", "jxl"}
+
+
+def _looks_like_media_url(url: str) -> bool:
+    """看起来是图片/视频直链（结尾是媒体扩展名）。"""
+    return str(_guess_file_ext_from_url(url)).strip().lower() in _MEDIA_URL_EXTENSIONS
+
+
+
+
+def _normalize_gallery_post(item: Any):
+    """把 Danbooru 的单条 post 记录规整成图库用的结构；不是受支持的图片则返回 None。"""
+    if not isinstance(item, dict):
+        return None
+    tag_string = str(item.get("tag_string", "") or "")
+    preview_url = _absolutize_danbooru_url(item.get("preview_file_url"))
+    if not preview_url:
+        return None
+    image_url = (
+        _absolutize_danbooru_url(item.get("file_url"))
+        or _absolutize_danbooru_url(item.get("large_file_url"))
+        or preview_url
+    )
+    display_url = (
+        _absolutize_danbooru_url(item.get("large_file_url"))
+        or _absolutize_danbooru_url(item.get("file_url"))
+        or preview_url
+    )
+    file_ext = str(item.get("file_ext", "") or "").strip().lower() or _guess_file_ext_from_url(image_url)
+    if file_ext and file_ext not in _ALLOWED_GALLERY_IMAGE_EXT:
+        return None
+    return {
+        "id": item.get("id"),
+        "preview_url": preview_url,
+        "image_url": image_url,
+        "display_url": display_url,
+        "preview_width": int(item.get("preview_width", 0) or 0),
+        "preview_height": int(item.get("preview_height", 0) or 0),
+        "image_width": int(item.get("image_width", 0) or 0),
+        "image_height": int(item.get("image_height", 0) or 0),
+        "tag_string": tag_string,
+        "prompt": _tag_string_to_prompt(tag_string),
+        "score": item.get("score", 0),
+        "rating": item.get("rating", ""),
+        "file_ext": file_ext,
+        "md5": item.get("md5", ""),
+        "source": str(item.get("source", "") or ""),
+        "tag_string_artist": str(item.get("tag_string_artist", "") or ""),
+        "tag_string_copyright": str(item.get("tag_string_copyright", "") or ""),
+        "tag_string_character": str(item.get("tag_string_character", "") or ""),
+        "tag_string_general": str(item.get("tag_string_general", "") or ""),
+        "tag_string_meta": str(item.get("tag_string_meta", "") or ""),
+    }
+
+
+def _fetch_gallery_post_by_id(post_id: Any):
+    """按 post id 取单条（给"粘贴链接直接看图"用），带缓存；不存在/非图片返回 None。"""
+    try:
+        pid = int(post_id)
+    except Exception:
+        return None
+    if pid <= 0:
+        return None
+    cache_key = f"id:{pid}"
+    now = time.time()
+    cached = _gallery_post_cache.get(cache_key)
+    if isinstance(cached, dict) and now - float(cached.get("ts", 0)) <= _GALLERY_POST_CACHE_TTL:
+        return cached.get("post")
+    try:
+        with _open_danbooru_url(f"{_DANBOORU_BASE_URL}/posts/{pid}.json", timeout=15, throttle=True) as response:
+            payload = response.read(4 * 1024 * 1024).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        if getattr(exc, "code", None) == 404:
+            return None
+        raise RuntimeError(_describe_danbooru_http_error(exc)) from exc
+    try:
+        item = json.loads(payload)
+    except Exception:
+        return None
+    post = _normalize_gallery_post(item)
+    _evict_oldest_cache_item(_gallery_post_cache, _GALLERY_POST_CACHE_LIMIT)
+    _gallery_post_cache[cache_key] = {"ts": now, "post": post}
+    return post
+
+
+def _extract_danbooru_post_id(url: str) -> int:
+    """从 danbooru 帖子链接里取 post id（/posts/123456）。"""
+    match = re.search(r"/posts?/(\d+)", str(url or ""))
+    try:
+        return int(match.group(1)) if match else 0
+    except Exception:
+        return 0
+
+
+def _source_match_token(url: str) -> str:
+    """从 source URL 里取一个足够独特的片段，用于 source:*token* 兜底查询。
+
+    Danbooru 的 source 精确匹配在超长 URL 上偶尔会 500（数据库查询超时），
+    真机实测 source:*<数字id>* 这种通配符查询是稳定的，所以用它兜底。
+    """
+    text = str(url or "")
+    try:
+        path = urllib.parse.urlsplit(text).path or ""
+    except Exception:
+        path = text
+    stem = os.path.splitext(os.path.basename(path))[0]
+    # 画师主页/用户页 URL 不该拿去做 source 查询
+    if re.search(r"/(?:users?|artists?|profile|members?)/", text.lower()):
+        return ""
+    match = re.search(r"\d{5,}", stem)
+    if match:
+        return match.group(0)
+    return stem if len(stem) >= 8 else ""
+
+
+def _extract_md5_from_url(url: str) -> str:
+    """从图片链接文件名里取 md5（Danbooru CDN 的 original 路径就是 md5）。"""
+    text = str(url or "")
+    try:
+        path = urllib.parse.urlsplit(text).path or ""
+    except Exception:
+        path = text
+    return _normalize_md5(os.path.splitext(os.path.basename(path))[0])
+
+
 def _fetch_gallery_posts(tags: str, limit: int, page: int, rating: str = "safe") -> List[Dict[str, Any]]:
     allowed_image_ext = {"jpg", "jpeg", "png", "webp", "bmp", "tiff", "tif"}
     rating_value = str(rating or "all").strip().lower()
+    if rating_value not in {"all", "safe", "questionable", "explicit"}:
+        rating_value = "safe"
     tag_parts = [str(tags or "").strip()]
     if rating_value and rating_value != "all":
         tag_parts.append(f"rating:{rating_value}")
@@ -1614,64 +1931,20 @@ def _fetch_gallery_posts(tags: str, limit: int, page: int, rating: str = "safe")
     })
     api_url = f"{_DANBOORU_BASE_URL}/posts.json?{query}"
 
-    with _open_danbooru_url(api_url, timeout=15) as response:
-        payload = response.read().decode("utf-8", errors="replace")
+    try:
+        with _open_danbooru_url(api_url, timeout=15, throttle=True) as response:
+            payload = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(_describe_danbooru_http_error(exc)) from exc
     parsed = json.loads(payload)
     if not isinstance(parsed, list):
         return []
 
     posts: List[Dict[str, Any]] = []
     for item in parsed:
-        if not isinstance(item, dict):
-            continue
-
-        post_id = item.get("id")
-        tag_string = str(item.get("tag_string", "") or "")
-        prompt = _tag_string_to_prompt(tag_string)
-
-        preview_url = _absolutize_danbooru_url(item.get("preview_file_url"))
-        if not preview_url:
-            continue
-
-        image_url = _absolutize_danbooru_url(item.get("file_url"))
-        if not image_url:
-            image_url = _absolutize_danbooru_url(item.get("large_file_url"))
-        if not image_url:
-            image_url = preview_url
-
-        display_url = (
-            _absolutize_danbooru_url(item.get("large_file_url"))
-            or _absolutize_danbooru_url(item.get("file_url"))
-            or preview_url
-        )
-
-        file_ext = str(item.get("file_ext", "") or "").strip().lower()
-        if not file_ext:
-            file_ext = _guess_file_ext_from_url(image_url)
-        if file_ext and file_ext not in allowed_image_ext:
-            continue
-
-        posts.append({
-            "id": post_id,
-            "preview_url": preview_url,
-            "image_url": image_url,
-            "display_url": display_url,
-            "preview_width": int(item.get("preview_width", 0) or 0),
-            "preview_height": int(item.get("preview_height", 0) or 0),
-            "image_width": int(item.get("image_width", 0) or 0),
-            "image_height": int(item.get("image_height", 0) or 0),
-            "tag_string": tag_string,
-            "prompt": prompt,
-            "score": item.get("score", 0),
-            "rating": item.get("rating", ""),
-            "file_ext": file_ext,
-            "md5": item.get("md5", ""),
-            "tag_string_artist": str(item.get("tag_string_artist", "") or ""),
-            "tag_string_copyright": str(item.get("tag_string_copyright", "") or ""),
-            "tag_string_character": str(item.get("tag_string_character", "") or ""),
-            "tag_string_general": str(item.get("tag_string_general", "") or ""),
-            "tag_string_meta": str(item.get("tag_string_meta", "") or ""),
-        })
+        normalized = _normalize_gallery_post(item)
+        if normalized:
+            posts.append(normalized)
 
     _evict_oldest_cache_item(_gallery_post_cache, _GALLERY_POST_CACHE_LIMIT)
     _gallery_post_cache[cache_key] = {
@@ -1699,8 +1972,11 @@ def _fetch_gallery_autocomplete(query: str, limit: int = 20) -> List[Dict[str, A
         "limit": limit,
     })
     api_url = f"{_DANBOORU_BASE_URL}/tags.json?{params}"
-    with _open_danbooru_url(api_url, timeout=10) as response:
-        payload = response.read().decode("utf-8", errors="replace")
+    try:
+        with _open_danbooru_url(api_url, timeout=10, throttle=True) as response:
+            payload = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(_describe_danbooru_http_error(exc)) from exc
     parsed = json.loads(payload)
     if not isinstance(parsed, list):
         return []
@@ -1726,6 +2002,347 @@ def _fetch_gallery_autocomplete(query: str, limit: int = 20) -> List[Dict[str, A
     return items
 
 
+def _gallery_image_cache_bytes() -> int:
+    total = 0
+    for value in _gallery_image_cache.values():
+        tensor = value.get("tensor") if isinstance(value, dict) else None
+        if tensor is not None:
+            try:
+                total += int(tensor.numel()) * int(tensor.element_size())
+            except Exception:
+                continue
+    return total
+
+
+def _enforce_gallery_image_cache_budget() -> None:
+    """按总字节数淘汰最旧的缓存项，避免一次性缓存很多大图吃满内存。"""
+    while _gallery_image_cache and _gallery_image_cache_bytes() > _GALLERY_IMAGE_CACHE_MAX_BYTES:
+        oldest_key = min(_gallery_image_cache.keys(), key=lambda k: _gallery_image_cache[k].get("ts", 0))
+        _gallery_image_cache.pop(oldest_key, None)
+
+
+def _decode_gallery_image_tensor(image_bytes: bytes) -> torch.Tensor:
+    """解码成 uint8(H,W,3) 缓存；float32 只在返回时临时转换，缓存体积降到 1/4。"""
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    image_arr = np.asarray(image, dtype=np.uint8)
+    return torch.from_numpy(image_arr.copy())
+
+
+def _tensor_to_image_batch(tensor) -> torch.Tensor:
+    if tensor is None:
+        return _empty_image_tensor()
+    if tensor.dim() == 4:
+        return tensor
+    if tensor.dtype != torch.float32:
+        tensor = tensor.to(torch.float32).div_(255.0)
+    return tensor[None,]
+
+
+_ARTIST_LOOKUP_CACHE_TTL = 900
+_ARTIST_LOOKUP_CACHE_LIMIT = 256
+_ARTIST_LOOKUP_MAX_POSTS = 20
+_ARTIST_LOOKUP_BATCH_LIMIT = 8
+_artist_lookup_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def _normalize_lookup_url(raw_url: Any) -> str:
+    """把 pixiv/twitter 链接归一化，方便和 Danbooru 的 source/artist url 对上。"""
+    text = str(raw_url or "").strip()
+    if not text:
+        return ""
+    if text.startswith("//"):
+        text = "https:" + text
+    elif text.startswith("/"):
+        text = _DANBOORU_BASE_URL + text
+    try:
+        parsed = urllib.parse.urlsplit(text)
+    except Exception:
+        return text
+    if not parsed.scheme or not parsed.netloc:
+        return text
+    path = re.sub(r"^/(?:en|ja|zh)/", "/", parsed.path or "")
+    path = path.rstrip("/")
+    return urllib.parse.urlunsplit((
+        parsed.scheme.lower(),
+        parsed.netloc.lower(),
+        path,
+        parsed.query or "",
+        "",
+    ))
+
+
+def _normalize_md5(raw_md5: Any) -> str:
+    value = re.sub(r"[^0-9a-fA-F]", "", str(raw_md5 or ""))
+    value = value.lower()
+    return value if len(value) == 32 else ""
+
+
+def _danbooru_api_json(path_and_query: str, timeout: int = 15, errors: Any = None):
+    """请求 Danbooru API 并解析 JSON；失败返回 None，并把原因写进 errors（如果给了）。"""
+    url = f"{_DANBOORU_BASE_URL}{path_and_query}"
+
+    def record(message: str) -> None:
+        print(f"[DanbooruTagToolkit] artist lookup request failed: {url} -> {message}")
+        if isinstance(errors, list):
+            errors.append(message)
+
+    try:
+        with _open_danbooru_url(url, timeout=timeout, throttle=True) as response:
+            payload = response.read(4 * 1024 * 1024).decode("utf-8", errors="replace")
+        return json.loads(payload)
+    except urllib.error.HTTPError as exc:
+        record(_describe_danbooru_http_error(exc))
+        return None
+    except Exception as exc:
+        record(str(exc))
+        return None
+
+
+def _extract_post_artists(posts: Any) -> Dict[str, Any]:
+    """从 /posts.json 结果里收集画师标签、来源 URL 与 post id。"""
+    artists: List[str] = []
+    sources: List[str] = []
+    post_ids: List[int] = []
+    if not isinstance(posts, list):
+        return {"artists": artists, "sources": sources, "post_ids": post_ids}
+    for item in posts:
+        if not isinstance(item, dict):
+            continue
+        try:
+            post_id = int(item.get("id") or 0)
+        except Exception:
+            post_id = 0
+        if post_id:
+            post_ids.append(post_id)
+        for tag in str(item.get("tag_string_artist") or "").split(" "):
+            tag = tag.strip()
+            if tag and tag not in artists:
+                artists.append(tag)
+        for part in str(item.get("source") or "").split("\n"):
+            part = part.strip()
+            if part and part not in sources:
+                sources.append(part)
+    return {"artists": artists, "sources": sources, "post_ids": post_ids}
+
+
+def _artist_records_by_url(url: str, limit: int = 10, errors: Any = None) -> List[Dict[str, Any]]:
+    query = urllib.parse.urlencode({
+        "search[url_matches]": url,
+        "search[order]": "post_count",
+        "limit": int(limit),
+    })
+    payload = _danbooru_api_json(f"/artists.json?{query}", errors=errors)
+    records: List[Dict[str, Any]] = []
+    if isinstance(payload, list):
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            records.append({
+                "name": name,
+                "id": int(item.get("id") or 0) or 0,
+                "post_count": int(item.get("post_count") or 0) or 0,
+                "urls": [
+                    str(entry.get("url") or "")
+                    for entry in (item.get("urls") or [])
+                    if isinstance(entry, dict) and entry.get("url")
+                ],
+            })
+    return records
+
+
+def _lookup_artist_sync(raw_url: str = "", raw_md5: str = "", max_posts: int = _ARTIST_LOOKUP_MAX_POSTS) -> Dict[str, Any]:
+    """② 来源 URL → ③ md5 → ① 画师主页 URL，全部匿名可用。"""
+    url = _normalize_lookup_url(raw_url)
+    md5_value = _normalize_md5(raw_md5)
+    attempts: List[Dict[str, Any]] = []
+    api_errors: List[str] = []
+    result: Dict[str, Any] = {
+        "matched_by": "none",
+        "artists": [],
+        "sources": [],
+        "post_ids": [],
+        "url": url,
+        "md5": md5_value,
+        "attempts": attempts,
+        "artist_ids": [],
+        "artist_records": [],
+    }
+
+    def finish() -> Dict[str, Any]:
+        result["errors"] = api_errors
+        return result
+
+    def apply(method: str, info: Dict[str, Any]) -> bool:
+        attempts.append({"method": method, "hits": len(info.get("post_ids") or []), "artists": len(info.get("artists") or [])})
+        if not info.get("artists"):
+            return False
+        result["matched_by"] = method
+        result["artists"] = info["artists"]
+        result["sources"] = info.get("sources") or []
+        result["post_ids"] = info.get("post_ids") or []
+        return True
+
+    if url:
+        query = urllib.parse.urlencode({"tags": f"source:{url}", "limit": int(max_posts)})
+        source_payload = _danbooru_api_json(f"/posts.json?{query}", errors=api_errors)
+        if not apply("source", _extract_post_artists(source_payload)):
+            # 精确 source 查询失败（偶发 500 超时）或没命中：用通配符再试一次
+            token = _source_match_token(url)
+            if token:
+                wildcard_query = urllib.parse.urlencode({"tags": f"source:*{token}*", "limit": int(max_posts)})
+                wildcard_info = _extract_post_artists(_danbooru_api_json(f"/posts.json?{wildcard_query}"))
+                if apply("source_wildcard", wildcard_info):
+                    return finish()
+        else:
+            return finish()
+
+    if md5_value:
+        query = urllib.parse.urlencode({"tags": f"md5:{md5_value}", "limit": 5})
+        md5_payload = _danbooru_api_json(f"/posts.json?{query}", errors=api_errors)
+        if apply("md5", _extract_post_artists(md5_payload)):
+            return finish()
+
+    if url and not _looks_like_media_url(url):
+        records = _artist_records_by_url(url, errors=api_errors)
+        attempts.append({"method": "artist_url", "hits": len(records), "artists": len(records)})
+        if records:
+            result["matched_by"] = "artist_url"
+            result["artists"] = [entry["name"] for entry in records]
+            result["artist_ids"] = [entry["id"] for entry in records]
+            result["artist_records"] = records
+            return finish()
+
+    result["errors"] = api_errors
+    return finish()
+
+
+def _resolve_gallery_url(raw_url: str) -> Dict[str, Any]:
+    """把用户粘贴的链接解析成"图库能直接显示的一张图"或"某位画师的作品"。
+
+    ① danbooru 帖子链接 → 直接取单帖
+    ② 作品页 / 图链 → source / md5 反查 → 取命中的帖
+    ③ 画师主页链接 → artists?url_matches → 画师标签（图库里按画师搜索）
+    """
+    site = _DANBOORU_BASE_URL
+    url = _normalize_lookup_url(raw_url)
+    result: Dict[str, Any] = {
+        "kind": "none",
+        "url": url,
+        "post": None,
+        "post_url": "",
+        "search_tags": "",
+        "artists": [],
+        "artist_ids": [],
+        "artist_url": "",
+        "artist_extra": 0,
+        "matched_by": "none",
+        "message": "",
+        "errors": [],
+        "attempts": [],
+    }
+    if not url:
+        result["message"] = "Empty URL."
+        return result
+
+    post_id = _extract_danbooru_post_id(url)
+    if post_id:
+        try:
+            post = _fetch_gallery_post_by_id(post_id)
+        except Exception as exc:
+            result["errors"].append(str(exc))
+            post = None
+        if post:
+            result.update({
+                "kind": "post",
+                "post": post,
+                "post_url": f"{site}/posts/{post_id}",
+                "matched_by": "post_url",
+                "artists": [tag for tag in str(post.get("tag_string_artist") or "").split(" ") if tag],
+                "message": f"Loaded Danbooru post #{post_id}.",
+            })
+            return result
+        if not result["errors"]:
+            result["message"] = f"Danbooru post #{post_id} 不存在，或者不是图库支持的图片类型（可能是视频/动图）。"
+
+    md5_guess = _extract_md5_from_url(url)
+    lookup = _lookup_artist_sync(url, md5_guess)
+    result["errors"].extend(list(lookup.get("errors") or []))
+    result["attempts"] = list(lookup.get("attempts") or [])
+
+    if lookup.get("matched_by") in {"source", "md5", "source_wildcard"} and lookup.get("post_ids"):
+        matched = _fetch_gallery_post_by_id(lookup["post_ids"][0])
+        if matched:
+            result.update({
+                "kind": "post",
+                "post": matched,
+                "post_url": f"{site}/posts/{matched.get('id')}",
+                "matched_by": str(lookup.get("matched_by")),
+                "artists": list(lookup.get("artists") or []),
+                "message": f"Matched by {lookup.get('matched_by')}.",
+            })
+            return result
+
+    if lookup.get("matched_by") == "artist_url" and lookup.get("artists"):
+        artists = [str(name) for name in lookup.get("artists") or [] if str(name).strip()]
+        artist_ids = list(lookup.get("artist_ids") or [])
+        first_id = int(artist_ids[0]) if artist_ids and int(artist_ids[0] or 0) > 0 else 0
+        result.update({
+            "kind": "artist",
+            "artists": artists,
+            "artist_ids": artist_ids,
+            "artist_extra": max(0, len(artists) - 1),
+            "artist_url": f"{site}/artists/{first_id}" if first_id else f"{site}/posts?tags={urllib.parse.quote(artists[0])}",
+            "search_tags": artists[0],
+            "matched_by": "artist_url",
+            "message": (
+                f"Artist: {artists[0]}"
+                + (f" (+{len(artists) - 1} more candidates)" if len(artists) > 1 else "")
+                + (f" - source lookup failed: {result['errors'][0][:90]}" if result["errors"] else "")
+            ),
+        })
+        return result
+
+    if not result["message"]:
+        if result["errors"]:
+            result["message"] = f"Lookup failed: {result['errors'][0]}"
+        else:
+            result["message"] = "Danbooru 上没有找到这个链接对应的帖子或画师（这张图可能没被上传过）。"
+    return result
+
+
+def _lookup_artist(raw_url: str = "", raw_md5: str = "") -> Dict[str, Any]:
+    """带 TTL + 容量上限的缓存包装（同一个链接/哈希不重复打 API）。"""
+    url = _normalize_lookup_url(raw_url)
+    md5_value = _normalize_md5(raw_md5)
+    cache_key = f"url={url}|md5={md5_value}"
+    now = time.time()
+    cached = _artist_lookup_cache.get(cache_key)
+    if isinstance(cached, dict) and now - float(cached.get("ts", 0)) <= _ARTIST_LOOKUP_CACHE_TTL:
+        return cached.get("result") or {}
+    result = _lookup_artist_sync(url, md5_value)
+    _cleanup_expired_cache_items(_artist_lookup_cache, _ARTIST_LOOKUP_CACHE_TTL)
+    _evict_oldest_cache_item(_artist_lookup_cache, _ARTIST_LOOKUP_CACHE_LIMIT)
+    _artist_lookup_cache[cache_key] = {"ts": now, "result": result}
+    return result
+
+
+def _lookup_artist_batch(items: Any) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    if not isinstance(items, list):
+        return results
+    for item in items[:_ARTIST_LOOKUP_BATCH_LIMIT]:
+        if not isinstance(item, dict):
+            continue
+        result = _lookup_artist(str(item.get("url") or item.get("source") or ""), str(item.get("md5") or ""))
+        entry = dict(result)
+        entry["key"] = str(item.get("key") or item.get("id") or "")
+        results.append(entry)
+    return results
+
+
 def _load_gallery_image_tensor(image_url: str) -> torch.Tensor:
     final_url = _absolutize_danbooru_url(image_url)
     if not final_url:
@@ -1737,21 +2354,23 @@ def _load_gallery_image_tensor(image_url: str) -> torch.Tensor:
         tensor = cached.get("tensor")
         if tensor is not None:
             cached["ts"] = time.time()
-            return tensor
+            return _tensor_to_image_batch(tensor)
 
     with _open_danbooru_url(final_url, timeout=20) as response:
-        image_bytes = response.read()
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    image_arr = np.array(image).astype(np.float32) / 255.0
-    image_tensor = torch.from_numpy(image_arr)[None,]
+        image_bytes = response.read(_MAX_GALLERY_IMAGE_BYTES + 1)
+    if len(image_bytes) > _MAX_GALLERY_IMAGE_BYTES:
+        raise ValueError("gallery image too large")
+
+    encoded_tensor = _decode_gallery_image_tensor(image_bytes)
 
     _cleanup_expired_cache_items(_gallery_image_cache, _GALLERY_IMAGE_CACHE_TTL)
     _evict_oldest_cache_item(_gallery_image_cache, _GALLERY_IMAGE_CACHE_LIMIT)
     _gallery_image_cache[final_url] = {
         "ts": time.time(),
-        "tensor": image_tensor,
+        "tensor": encoded_tensor,
     }
-    return image_tensor
+    _enforce_gallery_image_cache_budget()
+    return _tensor_to_image_batch(encoded_tensor)
 
 
 def _get_cached_gallery_image_tensor(image_url: str) -> torch.Tensor:
@@ -1765,7 +2384,7 @@ def _get_cached_gallery_image_tensor(image_url: str) -> torch.Tensor:
         tensor = cached.get("tensor")
         if tensor is not None:
             cached["ts"] = time.time()
-            return tensor
+            return _tensor_to_image_batch(tensor)
 
     return _load_gallery_image_tensor(final_url)
 
@@ -2238,6 +2857,10 @@ class DanbooruTagSorterSelectorNode:
                 "categories": normalized_bundle,
                 "category_labels": output_category_labels,
             }
+            # 节点数无限增长会一直吃内存，保留最近 N 个即可
+            while len(_latest_tag_bundle_by_node) > _LATEST_BUNDLE_CACHE_LIMIT:
+                oldest_key = next(iter(_latest_tag_bundle_by_node))
+                _latest_tag_bundle_by_node.pop(oldest_key, None)
 
         prefix_text = str(prefix_text or "").strip()
         if prefix_text and selected_text:
@@ -2479,7 +3102,8 @@ if PromptServer is not None and web is not None:
                 force_reload = _as_bool(data.get("force_reload", False), False)
                 is_comment = _as_bool(data.get("is_comment", True), True)
 
-                all_str, cat_dict, _, _, _, output_category_labels = _execute_sorting(
+                all_str, cat_dict, _, _, _, output_category_labels = await asyncio.to_thread(
+                    _execute_sorting,
                     tags=tags,
                     excel_file=excel_file,
                     category_mapping=category_mapping,
@@ -2519,7 +3143,7 @@ if PromptServer is not None and web is not None:
         @PromptServer.instance.routes.get("/danbooru_tag_picker/excel_files")
         async def list_excel_files_for_selector(request):
             try:
-                files = _list_available_tag_files()
+                files = await asyncio.to_thread(_list_available_tag_files)
                 return web.json_response({
                     "status": "success",
                     "files": files,
@@ -2536,7 +3160,7 @@ if PromptServer is not None and web is not None:
         @PromptServer.instance.routes.get("/danbooru_tag_picker/profile/list")
         async def list_sorter_profiles(request):
             try:
-                names = _list_sorter_presets()
+                names = await asyncio.to_thread(_list_sorter_presets)
                 return web.json_response({
                     "status": "success",
                     "profiles": names,
@@ -2554,7 +3178,7 @@ if PromptServer is not None and web is not None:
         async def load_sorter_profile(request):
             try:
                 name = str(request.query.get("name", "")).strip()
-                data = _load_sorter_preset(name)
+                data = await asyncio.to_thread(_load_sorter_preset, name)
                 return web.json_response({
                     "status": "success",
                     "profile": data,
@@ -2576,7 +3200,9 @@ if PromptServer is not None and web is not None:
                         "status": "error",
                         "message": "Invalid profile name",
                     }, status=400)
-                saved_name = _save_sorter_preset(name, body if isinstance(body, dict) else {})
+                saved_name = await asyncio.to_thread(
+                    _save_sorter_preset, name, body if isinstance(body, dict) else {}
+                )
                 return web.json_response({
                     "status": "success",
                     "profile_name": saved_name,
@@ -2592,6 +3218,8 @@ if PromptServer is not None and web is not None:
             try:
                 tags = str(request.query.get("tags", "")).strip()
                 rating = str(request.query.get("rating", "safe")).strip().lower()
+                if rating not in {"all", "safe", "questionable", "explicit"}:
+                    rating = "safe"
 
                 try:
                     limit = int(request.query.get("limit", 20))
@@ -2605,7 +3233,9 @@ if PromptServer is not None and web is not None:
                 limit = max(1, min(limit, 100))
                 page = max(1, min(page, 1000))
 
-                posts = _fetch_gallery_posts(tags=tags, limit=limit, page=page, rating=rating)
+                posts = await asyncio.to_thread(
+                    _fetch_gallery_posts, tags=tags, limit=limit, page=page, rating=rating
+                )
                 return web.json_response({
                     "status": "success",
                     "posts": posts,
@@ -2629,7 +3259,7 @@ if PromptServer is not None and web is not None:
                     limit = 20
                 limit = max(1, min(limit, 50))
 
-                items = _fetch_gallery_autocomplete(query=query, limit=limit)
+                items = await asyncio.to_thread(_fetch_gallery_autocomplete, query=query, limit=limit)
                 return web.json_response({
                     "status": "success",
                     "items": items,
@@ -2643,6 +3273,42 @@ if PromptServer is not None and web is not None:
                     "count": 0,
                 }, status=500)
 
+        @PromptServer.instance.routes.get("/danbooru_tag_picker/artist/lookup")
+        async def lookup_artist_for_node(request):
+            try:
+                url = str(request.query.get("url", "")).strip()
+                md5_value = str(request.query.get("md5", "")).strip()
+                if not url and not md5_value:
+                    return web.json_response({"status": "error", "message": "url or md5 is required"}, status=400)
+                result = await asyncio.to_thread(_lookup_artist, url, md5_value)
+                payload = {"status": "success"}
+                payload.update(result if isinstance(result, dict) else {})
+                return web.json_response(payload)
+            except Exception as e:
+                return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+        @PromptServer.instance.routes.post("/danbooru_tag_picker/artist/lookup_batch")
+        async def lookup_artists_batch(request):
+            try:
+                data = await request.json()
+                results = await asyncio.to_thread(_lookup_artist_batch, data.get("items") or [])
+                return web.json_response({"status": "success", "results": results})
+            except Exception as e:
+                return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+        @PromptServer.instance.routes.get("/danbooru_tag_picker/resolve")
+        async def resolve_gallery_url_route(request):
+            try:
+                url = str(request.query.get("url", "")).strip()
+                if not url:
+                    return web.json_response({"status": "error", "message": "url is required"}, status=400)
+                result = await asyncio.to_thread(_resolve_gallery_url, url)
+                payload = {"status": "success"}
+                payload.update(result if isinstance(result, dict) else {})
+                return web.json_response(payload)
+            except Exception as e:
+                return web.json_response({"status": "error", "message": str(e)}, status=500)
+
         @PromptServer.instance.routes.get("/danbooru_tag_gallery/image")
         async def proxy_gallery_image(request):
             raw_url = str(request.query.get("url", "")).strip()
@@ -2654,16 +3320,7 @@ if PromptServer is not None and web is not None:
                 }, status=400)
 
             try:
-                with _open_danbooru_url(final_url, timeout=20) as response:
-                    image_bytes = response.read()
-                    content_type = str(response.headers.get("Content-Type", "application/octet-stream"))
-                return web.Response(
-                    body=image_bytes,
-                    content_type=content_type.split(";", 1)[0].strip() or "application/octet-stream",
-                    headers={
-                        "Cache-Control": "public, max-age=300",
-                    },
-                )
+                return await _stream_gallery_image(request, final_url, 20)
             except Exception as e:
                 return web.json_response({
                     "status": "error",
@@ -2702,16 +3359,81 @@ if PromptServer is not None and web is not None:
         print(f"[DanbooruTagToolkit] Failed to register selector API routes: {e}")
 
 
+class DanbooruArtistLookupNode:
+    """按来源 URL / md5 / 画师主页 URL 反查画师标签（全部走匿名 API）。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url": ("STRING", {
+                    "multiline": False,
+                    "default": "",
+                    "placeholder": "作品页 / 画师主页 / 图链，例如 https://www.pixiv.net/artworks/1234567",
+                }),
+            },
+            "optional": {
+                "md5": ("STRING", {
+                    "multiline": False,
+                    "default": "",
+                    "placeholder": "可选：原文件的 32 位 md5（自己另存/再编码过的图对不上）",
+                }),
+                "mode": (["auto", "url", "md5"], {"default": "auto"}),
+                "separator": (["comma", "newline", "space"], {"default": "comma"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("artist_tags", "artists", "source", "post_id", "matched_by")
+    OUTPUT_IS_LIST = (False, True, False, False, False)
+    FUNCTION = "lookup_artist"
+    CATEGORY = "Danbooru Toolkit/Lookup"
+
+    def lookup_artist(self, url="", md5="", mode="auto", separator="comma"):
+        url_text = str(_unwrap_list_input(url, "") or "").strip()
+        md5_text = str(_unwrap_list_input(md5, "") or "").strip()
+        lookup_mode = str(_unwrap_list_input(mode, "auto") or "auto")
+        if lookup_mode == "url":
+            md5_text = ""
+        elif lookup_mode == "md5":
+            url_text = ""
+
+        if not url_text and not md5_text:
+            return ("", [], "", "", "none")
+
+        result = _lookup_artist(url_text, md5_text)
+        artists = [str(name) for name in (result.get("artists") or []) if str(name).strip()]
+        sources = [str(item) for item in (result.get("sources") or []) if str(item).strip()]
+        post_ids = [str(item) for item in (result.get("post_ids") or []) if str(item).strip()]
+        separator_value = {"comma": ", ", "newline": "\n", "space": " "}.get(
+            str(_unwrap_list_input(separator, "comma") or "comma"), ", "
+        )
+
+        api_errors = result.get("errors") or []
+        if api_errors and not artists:
+            print(f"[DanbooruTagToolkit] artist lookup errors: {api_errors}")
+        print(f"[DanbooruTagToolkit] artist lookup: matched_by={result.get('matched_by')} artists={artists}")
+        return (
+            separator_value.join(artists),
+            artists,
+            sources[0] if sources else "",
+            post_ids[0] if post_ids else "",
+            str(result.get("matched_by") or "none"),
+        )
+
+
 # Registration 我的回合！注册！
 NODE_CLASS_MAPPINGS = {
     "DanbooruTagSorterSelectorNode": DanbooruTagSorterSelectorNode,
     "DanbooruTagGalleryLiteNode": DanbooruTagGalleryLiteNode,
     "DanbooruTagSpecificCleanerNode": DanbooruTagSpecificCleanerNode,
+    "DanbooruArtistLookupNode": DanbooruArtistLookupNode,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DanbooruTagSorterSelectorNode": "Danbooru Tag Toolkit - All-in-One",
     "DanbooruTagGalleryLiteNode": "Danbooru Tag Toolkit - Danbooru Gallery Lite",
     "DanbooruTagSpecificCleanerNode": "Danbooru Tag Toolkit - Specific Tag Cleaner",
+    "DanbooruArtistLookupNode": "Danbooru Tag Toolkit - Artist Lookup",
 }
 
 # 都看到这里了球球给我点点Star吧...(哭

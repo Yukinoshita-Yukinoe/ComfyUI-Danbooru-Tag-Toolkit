@@ -21,6 +21,53 @@ DATA_FILE = os.path.join(PROMPT_SELECTOR_DIR, "data.json")
 DEFAULT_DATA_FILE = os.path.join(PROMPT_SELECTOR_DIR, "default.json")
 PREVIEW_DIR = os.path.join(PROMPT_SELECTOR_DIR, "preview")
 
+# 预览图安全策略：上传 / zip 导入 / 图片接口共用（白名单扩展名 + 单文件大小上限）
+ALLOWED_PREVIEW_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+MAX_PREVIEW_IMAGE_BYTES = 16 * 1024 * 1024
+
+
+def _sniff_image_extension(header):
+    """按文件头判断图片类型，返回扩展名；不是受支持的图片则返回空串。"""
+    data = bytes(header or b"")
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return ".gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data[:2] == b"BM":
+        return ".bmp"
+    return ""
+
+
+def _safe_preview_filename(raw_name):
+    """把外部来源的图片名收敛为 PREVIEW_DIR 下的纯文件名；不合法返回空串。"""
+    name = os.path.basename(str(raw_name or "").replace("\\", "/")).strip()
+    if not name or name in {".", ".."} or "\x00" in name:
+        return ""
+    if os.path.splitext(name)[1].lower() not in ALLOWED_PREVIEW_EXTENSIONS:
+        return ""
+    return name
+
+
+def _resolve_preview_path(raw_name):
+    """返回 PREVIEW_DIR 内某个文件的绝对路径；越界或非法名称返回空串。"""
+    name = _safe_preview_filename(raw_name)
+    if not name:
+        return ""
+    root = os.path.abspath(PREVIEW_DIR)
+    path = os.path.abspath(os.path.join(root, name))
+    try:
+        if os.path.commonpath([path, root]) != root:
+            return ""
+    except ValueError:
+        return ""
+    return path
+
+
+
 
 # === 数据安全工具函数 ===
 
@@ -296,15 +343,20 @@ async def save_data(request):
 @PromptServer.instance.routes.get("/dtt_prompt_selector/preview/{filename}")
 async def get_preview_image(request):
     filename = request.match_info['filename']
-    image_path = os.path.join(PREVIEW_DIR, filename)
-    
-    # 安全检查，防止路径遍历
-    if not os.path.abspath(image_path).startswith(os.path.abspath(PREVIEW_DIR)):
+    image_path = _resolve_preview_path(filename)
+    if not image_path:
         return web.Response(status=403)
-        
-    if os.path.exists(image_path):
-        return web.FileResponse(image_path)
-    return web.Response(status=404)
+    if not os.path.isfile(image_path):
+        return web.Response(status=404)
+    return web.FileResponse(
+        image_path,
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+            "Cache-Control": "private, max-age=60",
+        },
+    )
+
 
 @PromptServer.instance.routes.post("/dtt_prompt_selector/upload_image")
 async def upload_image(request):
@@ -315,24 +367,25 @@ async def upload_image(request):
     if not image_file or not image_file.file:
         return web.json_response({"error": "No image file uploaded"}, status=400)
 
+    header = image_file.file.read(32)
+    file_extension = _sniff_image_extension(header)
+    if not file_extension:
+        return web.json_response(
+            {"error": "Unsupported image format (png/jpg/webp/gif/bmp only)"},
+            status=415,
+        )
+
     if not os.path.exists(PREVIEW_DIR):
         os.makedirs(PREVIEW_DIR)
 
-    _, file_extension = os.path.splitext(image_file.filename)
-    if not file_extension:
-        file_extension = '.png'
-
-    # Sanitize the alias to create a valid filename
-    sanitized_alias = "".join(c for c in alias if c.isalnum() or c in (' ', '_')).rstrip()
+    sanitized_alias = "".join(c for c in alias if c.isalnum() or c in ('_', '-', ' ')).strip()
+    sanitized_alias = sanitized_alias.replace(" ", "_")[:60]
     if not sanitized_alias:
         sanitized_alias = "untitled"
 
-    # Create a unique filename based on alias and timestamp
     timestamp = int(time.time())
     unique_filename = f"{sanitized_alias}_{timestamp}{file_extension}"
     image_path = os.path.join(PREVIEW_DIR, unique_filename)
-
-    # Ensure the filename is unique
     count = 1
     while os.path.exists(image_path):
         unique_filename = f"{sanitized_alias}_{timestamp}_{count}{file_extension}"
@@ -340,12 +393,30 @@ async def upload_image(request):
         count += 1
 
     try:
-        with open(image_path, 'wb') as f:
-            shutil.copyfileobj(image_file.file, f)
-        
+        total = len(header)
+        with open(image_path, "wb") as target:
+            target.write(header)
+            while True:
+                chunk = image_file.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_PREVIEW_IMAGE_BYTES:
+                    raise ValueError("image too large")
+                target.write(chunk)
         return web.json_response({"filename": unique_filename})
+    except ValueError:
+        if os.path.exists(image_path):
+            os.remove(image_path)
+        return web.json_response(
+            {"error": f"Image too large (limit {MAX_PREVIEW_IMAGE_BYTES // (1024 * 1024)}MB)"},
+            status=413,
+        )
     except Exception as e:
+        if os.path.exists(image_path):
+            os.remove(image_path)
         return web.json_response({"error": str(e)}, status=500)
+
 
 def _ensure_data_compatibility(data):
     """确保导入的数据与当前版本兼容，自动添加时间戳字段"""
@@ -595,14 +666,34 @@ async def import_zip(request):
             if not os.path.exists(PREVIEW_DIR):
                 os.makedirs(PREVIEW_DIR)
                 
-            for image_name in imported_images:
+            for raw_image_name in imported_images:
+                image_name = _safe_preview_filename(raw_image_name)
+                if not image_name:
+                    # 非法名称（子目录、越界、非图片扩展名）直接跳过，绝不写盘
+                    logger.warning("skip unsafe imported image name: %r", raw_image_name)
+                    continue
                 zip_image_path = f'preview/{image_name}'
-                if zip_image_path in zf.namelist():
-                    target_path = os.path.join(PREVIEW_DIR, image_name)
-                    # 只有当文件不存在时才写入，避免覆盖
-                    if not os.path.exists(target_path):
-                        with zf.open(zip_image_path) as source, open(target_path, 'wb') as target:
-                            shutil.copyfileobj(source, target)
+                if zip_image_path not in zf.namelist():
+                    continue
+                target_path = os.path.join(PREVIEW_DIR, image_name)
+                if os.path.exists(target_path):
+                    continue
+                written = 0
+                too_large = False
+                with zf.open(zip_image_path) as source, open(target_path, 'wb') as target:
+                    while True:
+                        chunk = source.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        if written > MAX_PREVIEW_IMAGE_BYTES:
+                            too_large = True
+                            break
+                        target.write(chunk)
+                if too_large:
+                    logger.warning("skip oversized imported image: %s", image_name)
+                    if os.path.exists(target_path):
+                        os.remove(target_path)
 
             # 保存合并后的数据（使用原子保存机制）
             _atomic_save_json(DATA_FILE, local_data, create_backup=True)

@@ -1,5 +1,48 @@
 # Changelog
 
+## 1.1.0 - 2026-09-14
+
+### Added
+
+- **Artist Lookup node** (`DanbooruArtistLookupNode`): resolves artist tags from a post source URL, an artist page URL,
+  or the original file md5 (anonymous Danbooru API, no key required).
+- **URL input in the gallery search box**: Danbooru post links open that post directly, artwork URLs are matched by
+  `source` (or `md5` for CDN links), artist page URLs switch to that artist's posts, with links to the post / artist page.
+- Gallery posts now carry the Danbooru `source` field; artist tags are shown under each card and in the selected list and
+  are clickable (they open the artist's posts on Danbooru).
+- `Danbooru Tag Toolkit - Dataset Saver` node: saves gallery images together with same-name `.txt` caption sidecars
+  (optional previews, optional embedded workflow).
+- Gallery thumbnails now retry transient failures with backoff and show a `Retry` placeholder instead of dropping the post.
+- New backend endpoints: streaming gallery image proxy, `/danbooru_tag_picker/resolve`,
+  `/danbooru_tag_picker/artist/lookup` + `/lookup_batch`, `/danbooru_tag_gallery/cache/stats|clear`.
+
+### Fixed
+
+- **Security**: user-controlled strings are rendered with `textContent` / property assignment instead of `innerHTML`
+  (prompt selector, gallery, tag labels, tooltips, image names), so an imported prompt library can no longer inject scripts.
+- **Security**: preview uploads are content-sniffed and whitelisted (png/jpg/webp/gif/bmp, 16 MB cap), preview URLs are
+  confined to `prompt_selector/preview/`, and zip imports can no longer write outside that folder (zip-slip).
+- Gallery cards were cropped at any canvas zoom other than 100% (card heights now account for the canvas scale).
+- Gallery cards could be clipped while images were still loading (heights now come from the post aspect ratio).
+- Gallery thumbnails that failed once were removed from the page and from the saved state.
+- The prompt selector side preview panel could appear in the top-left corner of the canvas after switching workflows.
+- Two prompt selector nodes fought over the same tooltip / library window (per-node ownership + per-instance modal).
+- Gallery masonry layout re-measured on every image load and could reflow the whole grid dozens of times.
+- Prompt preview images were re-downloaded on every hover (cache-buster removed, image element reused).
+- Blocking network / file IO inside `aiohttp` handlers (gallery posts, autocomplete, image proxy, pandas parses, profile
+  files, artist lookups) now runs in worker threads.
+- `403 Forbidden` from Danbooru is reported as a clear rate-limit message (and the request falls back when only the
+  custom `User-Agent` was rejected) instead of a bare HTTP error.
+
+### Changed
+
+- All Danbooru API calls share a global 1 request/second throttle plus caches (posts 2 min, autocomplete 5 min, artist
+  lookups 15 min); image downloads are not throttled.
+- The gallery image proxy streams the response instead of buffering the whole file in memory.
+- The prompt selector preview panel only runs its `requestAnimationFrame` loop while it is actually active.
+- Removed the redundant `Resolve Artist` gallery button in favour of the URL-aware search box.
+- Removed dead code (unused tooltip paths / CSS) and avoided redundant style writes in the gallery grid.
+
 ## 1.0.2 - 2026-05-26
 
 ### Added
