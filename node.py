@@ -1908,49 +1908,173 @@ def _extract_md5_from_url(url: str) -> str:
     return _normalize_md5(os.path.splitext(os.path.basename(path))[0])
 
 
-def _fetch_gallery_posts(tags: str, limit: int, page: int, rating: str = "safe") -> List[Dict[str, Any]]:
-    allowed_image_ext = {"jpg", "jpeg", "png", "webp", "bmp", "tiff", "tif"}
+_GALLERY_ORDER_MODES = {
+    "newest": {"order": "", "floor": "", "strong": ""},
+    # 真机实测：单用 order:score / order:favcount / order:random 会 500（Danbooru 全表排序超时），
+    # 配上质量门槛就稳定；门槛太高也会超时（favcount:>1000），所以升级值取实测可用的档位。
+    "score": {"order": "order:score", "floor": "score:>100", "strong": "score:>1000"},
+    "favcount": {"order": "order:favcount", "floor": "favcount:>100", "strong": "favcount:>500"},
+    "random": {"order": "order:random", "floor": "score:>200", "strong": "score:>1000"},
+}
+
+
+def _build_gallery_tag_query(tags: str, rating: str, order: str, min_score: Any, floor_override: str = "") -> str:
+    """拼 Danbooru 搜索串：标签 + rating + 最低分 + 排序（用户自己写了就不重复添加）。"""
+    mode = _GALLERY_ORDER_MODES.get(str(order or "newest").strip().lower(), _GALLERY_ORDER_MODES["newest"])
+    parts = [str(tags or "").strip()]
     rating_value = str(rating or "all").strip().lower()
-    if rating_value not in {"all", "safe", "questionable", "explicit"}:
-        rating_value = "safe"
-    tag_parts = [str(tags or "").strip()]
-    if rating_value and rating_value != "all":
-        tag_parts.append(f"rating:{rating_value}")
-    final_tags = " ".join([p for p in tag_parts if p]).strip()
+    if rating_value in {"safe", "questionable", "explicit"}:
+        parts.append(f"rating:{rating_value}")
+    try:
+        score_floor = int(float(min_score or 0))
+    except Exception:
+        score_floor = 0
+    score_floor = max(0, min(score_floor, 1_000_000))
+    if score_floor > 0:
+        parts.append(f"score:>={score_floor}")
 
-    cache_key = f"{final_tags}|{limit}|{page}"
-    now = time.time()
-    cached = _gallery_post_cache.get(cache_key)
-    if cached and (now - cached.get("ts", 0) <= _GALLERY_POST_CACHE_TTL):
-        return cached.get("posts", [])
+    joined = " ".join([p for p in parts if p]).lower()
+    user_has_order = "order:" in joined
+    user_has_score = "score:" in joined
+    user_has_favcount = "favcount:" in joined
 
+    floor = str(floor_override or mode.get("floor") or "").strip()
+    if floor and not score_floor and not user_has_score and not user_has_favcount:
+        parts.append(floor)
+    if mode.get("order") and not user_has_order:
+        parts.append(mode["order"])
+    return " ".join([p for p in parts if p]).strip()
+
+
+def _request_gallery_posts(final_tags: str, limit: int, page: int) -> List[Dict[str, Any]]:
     query = urllib.parse.urlencode({
         "tags": final_tags,
         "limit": int(limit),
         "page": int(page),
     })
     api_url = f"{_DANBOORU_BASE_URL}/posts.json?{query}"
-
     try:
-        with _open_danbooru_url(api_url, timeout=15, throttle=True) as response:
+        with _open_danbooru_url(api_url, timeout=20, throttle=True) as response:
             payload = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         raise RuntimeError(_describe_danbooru_http_error(exc)) from exc
     parsed = json.loads(payload)
     if not isinstance(parsed, list):
         return []
-
     posts: List[Dict[str, Any]] = []
     for item in parsed:
         normalized = _normalize_gallery_post(item)
         if normalized:
             posts.append(normalized)
+    return posts
+
+
+def _fetch_gallery_posts(
+    tags: str,
+    limit: int,
+    page: int,
+    rating: str = "safe",
+    order: str = "newest",
+    min_score: Any = 0,
+    meta: Any = None,
+) -> List[Dict[str, Any]]:
+    """取一页 post：标签 / rating / 排序 / 最低分。
+
+    order 可选 newest（默认）/ score / favcount / random；排序模式下会自动带一个质量门槛
+    （Danbooru 全表排序会超时），超时或静默返回空时会用更高的门槛再试一次。
+    """
+    mode_key = str(order or "newest").strip().lower()
+    if mode_key not in _GALLERY_ORDER_MODES:
+        mode_key = "newest"
+    mode = _GALLERY_ORDER_MODES[mode_key]
+    final_tags = _build_gallery_tag_query(tags, rating, mode_key, min_score)
+    notice = ""
+
+    cache_key = f"{final_tags}|{int(limit)}|{int(page)}"
+    now = time.time()
+    cached = _gallery_post_cache.get(cache_key)
+    if cached and (now - cached.get("ts", 0) <= _GALLERY_POST_CACHE_TTL):
+        if isinstance(meta, dict):
+            meta["used_tags"] = final_tags
+            meta["notice"] = ""
+        return cached.get("posts", [])
+
+    raw_lower = f" {str(tags or '').lower()} "
+    try:
+        user_min_score = max(0, int(float(min_score or 0)))
+    except Exception:
+        user_min_score = 0
+    user_floor = ("score:" in raw_lower) or ("favcount:" in raw_lower) or user_min_score > 0
+
+    strong_floor = str(mode.get("strong") or "").strip()
+    attempt_tags = [final_tags]
+    if not user_floor and strong_floor and strong_floor not in final_tags:
+        attempt_tags.append(
+            _build_gallery_tag_query(tags, rating, mode_key, min_score, floor_override=strong_floor)
+        )
+    elif user_floor and mode_key != "newest":
+        # 用户自己给了门槛：原样再试一次，不擅自改动门槛
+        attempt_tags.append(final_tags)
+
+
+    # 最后一次兜底：Danbooru 自己的 Popular 排序（order:rank），宽泛搜索也基本不会空
+
+    popular_query = ""
+
+    if mode_key != "newest" and "order:" not in f" {str(tags or '').lower()} ":
+
+        candidate = f"{_build_gallery_tag_query(tags, rating, 'newest', min_score)} order:rank".strip()
+
+        if candidate and candidate not in attempt_tags:
+
+            attempt_tags.append(candidate)
+
+            popular_query = candidate
+
+
+    posts: List[Dict[str, Any]] = []
+    last_error = None
+    for index, attempt_query in enumerate(attempt_tags):
+        is_last = index == len(attempt_tags) - 1
+        try:
+            posts = _request_gallery_posts(attempt_query, limit, page)
+            last_error = None
+        except RuntimeError as exc:
+            last_error = exc
+            message = str(exc)
+            if not is_last and ("QueryCanceled" in message or " 500:" in message):
+                print(f"[DanbooruTagToolkit] gallery order query timed out, retrying with {attempt_tags[index + 1]}")
+                continue
+            raise
+        if posts:
+            if attempt_query != final_tags:
+                final_tags = attempt_query
+                cache_key = f"{final_tags}|{int(limit)}|{int(page)}"
+                if popular_query and attempt_query == popular_query:
+                    notice = "Sorted query returned nothing; showing Popular (order:rank) instead."
+                else:
+                    notice = f"Order query timed out, floor raised to {strong_floor}."
+            break
+        if not is_last:
+            print(f"[DanbooruTagToolkit] gallery query returned no rows, retrying with {attempt_tags[index + 1]}")
+            continue
+        if attempt_query != final_tags:
+            final_tags = attempt_query
+            cache_key = f"{final_tags}|{int(limit)}|{int(page)}"
+        if mode_key != "newest":
+            notice = "No results for this order/floor (Danbooru may have timed out; try a tag or a higher floor)."
+
+    if last_error is not None and not posts:
+        raise last_error
 
     _evict_oldest_cache_item(_gallery_post_cache, _GALLERY_POST_CACHE_LIMIT)
     _gallery_post_cache[cache_key] = {
         "ts": now,
         "posts": posts,
     }
+    if isinstance(meta, dict):
+        meta["used_tags"] = final_tags
+        meta["notice"] = notice
     return posts
 
 
@@ -3220,6 +3344,9 @@ if PromptServer is not None and web is not None:
                 rating = str(request.query.get("rating", "safe")).strip().lower()
                 if rating not in {"all", "safe", "questionable", "explicit"}:
                     rating = "safe"
+                order = str(request.query.get("order", "newest")).strip().lower()
+                if order not in _GALLERY_ORDER_MODES:
+                    order = "newest"
 
                 try:
                     limit = int(request.query.get("limit", 20))
@@ -3229,17 +3356,26 @@ if PromptServer is not None and web is not None:
                     page = int(request.query.get("page", 1))
                 except Exception:
                     page = 1
+                try:
+                    min_score = int(float(request.query.get("min_score", 0)))
+                except Exception:
+                    min_score = 0
 
                 limit = max(1, min(limit, 100))
                 page = max(1, min(page, 1000))
+                min_score = max(0, min(min_score, 1_000_000))
 
+                meta = {}
                 posts = await asyncio.to_thread(
-                    _fetch_gallery_posts, tags=tags, limit=limit, page=page, rating=rating
+                    _fetch_gallery_posts, tags, limit, page, rating, order, min_score, meta
                 )
                 return web.json_response({
                     "status": "success",
                     "posts": posts,
                     "count": len(posts),
+                    "order": order,
+                    "used_tags": meta.get("used_tags", ""),
+                    "notice": meta.get("notice", ""),
                 })
             except Exception as e:
                 return web.json_response({
@@ -3248,6 +3384,7 @@ if PromptServer is not None and web is not None:
                     "posts": [],
                     "count": 0,
                 }, status=500)
+
 
         @PromptServer.instance.routes.get("/danbooru_tag_gallery/autocomplete")
         async def get_autocomplete_for_gallery(request):

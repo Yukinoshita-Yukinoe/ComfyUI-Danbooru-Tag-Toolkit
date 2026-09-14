@@ -131,6 +131,20 @@ function injectStyle() {
             padding: 0 8px;
             font-size: 12px;
         }
+        .dtg-filter-row {
+            grid-column: 1 / -1;
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .dtg-filter-row .dtg-label {
+            color: #8c8c8c;
+            font-size: 11px;
+        }
+        .dtg-score-input {
+            width: 76px;
+        }
         .dtg-page-input {
             width: 82px;
         }
@@ -987,6 +1001,43 @@ app.registerExtension({
             goBtn.className = "dtg-btn";
             goBtn.textContent = "Go";
 
+            const orderSelect = document.createElement("select");
+            orderSelect.className = "dtg-select";
+            orderSelect.title = "Post order (score / favcount need a quality floor on Danbooru)";
+            orderSelect.innerHTML = `
+                <option value="newest">newest</option>
+                <option value="score">best score</option>
+                <option value="favcount">most favorites</option>
+                <option value="random">random</option>
+            `;
+            orderSelect.value = "newest";
+
+            const minScoreInput = document.createElement("input");
+            minScoreInput.className = "dtg-number dtg-score-input";
+            minScoreInput.type = "number";
+            minScoreInput.min = "0";
+            minScoreInput.max = "100000";
+            minScoreInput.step = "50";
+            minScoreInput.value = "0";
+            minScoreInput.title = "Minimum score (0 = automatic floor for score/favcount/random)";
+
+            const filterRow = document.createElement("div");
+            filterRow.className = "dtg-filter-row";
+            const orderLabel = document.createElement("span");
+            orderLabel.className = "dtg-label";
+            orderLabel.textContent = "Order:";
+            const scoreLabel = document.createElement("span");
+            scoreLabel.className = "dtg-label";
+            scoreLabel.textContent = "Min score:";
+            const scoreHint = document.createElement("span");
+            scoreHint.className = "dtg-label";
+            scoreHint.textContent = "(0 = auto)";
+            filterRow.appendChild(orderLabel);
+            filterRow.appendChild(orderSelect);
+            filterRow.appendChild(scoreLabel);
+            filterRow.appendChild(minScoreInput);
+            filterRow.appendChild(scoreHint);
+
             toolbar.appendChild(searchWrap);
             toolbar.appendChild(ratingSelect);
             toolbar.appendChild(limitInput);
@@ -995,6 +1046,7 @@ app.registerExtension({
             toolbar.appendChild(nextBtn);
             toolbar.appendChild(pageInput);
             toolbar.appendChild(goBtn);
+            toolbar.appendChild(filterRow);
 
             const categoryBar = document.createElement("div");
             categoryBar.className = "dtg-categories";
@@ -1081,6 +1133,8 @@ app.registerExtension({
                 searchInput,
                 ratingSelect,
                 limitInput,
+                orderSelect,
+                minScoreInput,
                 pageInput,
                 categoryCheckboxes,
                 suggestBox,
@@ -1235,6 +1289,8 @@ app.registerExtension({
                     search: String(state.searchInput.value || ""),
                     rating: String(state.ratingSelect.value || "safe"),
                     limit: Math.max(1, Math.min(100, Number(state.limitInput.value || 24))),
+                    order: String(state.orderSelect?.value || "newest"),
+                    min_score: Math.max(0, Number(state.minScoreInput?.value || 0)),
                     page: Math.max(1, Number(state.page || 1)),
                     scroll_top: Math.max(0, Number(state.grid.scrollTop || 0)),
                     selected_categories: getSelectedCategories(),
@@ -1929,6 +1985,8 @@ app.registerExtension({
                         rating,
                         limit: String(limit),
                         page: String(state.page),
+                        order: String(state.orderSelect?.value || "newest"),
+                        min_score: String(Math.max(0, Number(state.minScoreInput?.value || 0))),
                     });
                     const response = await api.fetchApi(`/danbooru_tag_gallery/posts?${query.toString()}`, { cache: "no-store" });
                     if (!response.ok) {
@@ -1954,7 +2012,11 @@ app.registerExtension({
                         });
                     state.posts = Array.from(dedup.values());
                     state.pendingScrollTop = 0;
-                    state.statusEl.textContent = `Loaded ${state.posts.length} posts.`;
+                    const usedTags = String(payload?.used_tags || "").trim();
+                    const orderNotice = String(payload?.notice || "").trim();
+                    state.statusEl.textContent = `Loaded ${state.posts.length} posts.`
+                        + (usedTags ? ` · ${usedTags}` : "")
+                        + (orderNotice ? ` · ${orderNotice}` : "");
                     renderPosts();
                     syncStateWidget(true);
                 } catch (error) {
@@ -2012,6 +2074,10 @@ app.registerExtension({
             ratingSelect.value = ["all", "safe", "questionable", "explicit"].includes(rating) ? rating : "safe";
             const limit = Math.max(1, Math.min(100, Number(uiState.limit || 24)));
             limitInput.value = String(limit);
+            const restoredOrder = String(uiState.order || "newest");
+            orderSelect.value = ["newest", "score", "favcount", "random"].includes(restoredOrder) ? restoredOrder : "newest";
+            const restoredMinScore = Math.max(0, Math.min(100000, Number(uiState.min_score || 0)));
+            minScoreInput.value = String(restoredMinScore);
             state.page = Math.max(1, Number(uiState.page || 1));
             state.pendingScrollTop = Math.max(0, Number(uiState.scroll_top || 0));
 
@@ -2079,6 +2145,8 @@ app.registerExtension({
                 setTimeout(() => closeSuggest(), 120);
             });
             ratingSelect.addEventListener("change", () => syncStateWidget(false));
+            orderSelect.addEventListener("change", () => syncStateWidget(false));
+            minScoreInput.addEventListener("change", () => syncStateWidget(false));
             limitInput.addEventListener("change", () => {
                 const limit = Math.max(1, Math.min(100, Number(limitInput.value || 24)));
                 limitInput.value = String(limit);

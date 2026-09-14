@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Gallery ordering: `newest` (default) / `best score` / `most favorites` / `random`, plus a `Min score` field.
+  Because Danbooru's bare `order:score` / `order:favcount` / `order:random` searches time out, the node adds a quality
+  floor automatically (`score:>100`, `favcount:>100`, `score:>200`) and raises it if the API still times out.
+- Gallery status line now shows the query that was actually sent (`used_tags`) and any fallback notice.
+
+### Fixed
+
+- Ordered gallery queries that return an empty page (Danbooru occasionally swallows a timeout) are retried once.
+
 ## 1.1.0 - 2026-09-14
 
 ### Added
