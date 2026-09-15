@@ -65,6 +65,27 @@ pip install -r requirements.txt
 - `Rating`, `Limit` and paging (`Load`, `Prev`, `Next`, page + `Go`) work as expected.
 - `Select Page` selects every loaded post, `Clear Selection` clears, `Clear Cache` drops the server-side post/image caches.
 
+### Ordering and quality floor
+
+Danbooru's bare `order:score` / `order:favcount` / `order:random` searches time out (HTTP 500 `QueryCanceled` on their
+side), so the toolbar's `Order` selector adds a quality floor automatically:
+
+| Order | Query sent to Danbooru | On timeout |
+|---|---|---|
+| `newest` (default) | your tags + rating only | - |
+| `best score` | `score:>100 order:score` | retried with `score:>1000` |
+| `most favorites` | `favcount:>100 order:favcount` | retried with `favcount:>500` |
+| `random` | `score:>200 order:random` | retried with `score:>1000` |
+
+- `Min score` (default `0` = automatic) overrides the floor with `score:>=N`.
+- Only browser-displayable still images are requested (`filetype:jpg,png,webp,gif,bmp` is appended automatically).
+  This matters a lot for the ordered modes: most all-time high-score posts are `mp4`/`webm` animations, so without the
+  filter `best score` only produced a handful of cards per page. Type `filetype:` yourself to override it.
+- Slightly more posts than requested are fetched and trimmed, so a page still fills up if a few entries have no preview image.
+- If you type `order:` / `score:` / `favcount:` yourself, nothing is added - the search box always wins.
+- The status line shows the query that was actually used, e.g. `Loaded 24 posts. · meion score:>100 order:score`.
+- Ordered queries that come back empty (Danbooru sometimes swallows a timeout) are retried once.
+
 ### Pasting a URL into the search box
 
 Only inputs starting with `http(s)://` (or `//`) are treated as URLs; everything else stays a tag search.
