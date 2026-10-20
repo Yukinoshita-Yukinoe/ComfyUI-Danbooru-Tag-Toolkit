@@ -1,3 +1,6 @@
 openpyxl
 pandas
 Pillow
+# PixAI Tagger node; torch/torchvision come with ComfyUI and must not be pinned here.
+transformers>=4.56
+timm>=1.0

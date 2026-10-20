@@ -6,6 +6,7 @@ artist tags from external URLs, and manage a personal prompt library.
 ## Highlights
 
 - **All-in-One tag sorter + visual selector** driven by your own Excel/CSV category database
+- **PixAI Tagger v1.0**: tag local images into 30,877 Danbooru tags and feed them into the sorter / dataset saver
 - **Danbooru Gallery Lite**: search posts, pick images + prompts, paste a URL to jump straight to a post or artist
 - **Artist Lookup**: external URL -> Danbooru artist tag (`source`, `md5`, artist page URLs; fully anonymous)
 - **Prompt Selector / Prompt Mixer**: local prompt library with preview images, weights and drag reordering
@@ -34,6 +35,7 @@ artist tags from external URLs, and manage a personal prompt library.
 | `Danbooru Tag Toolkit - Danbooru Gallery Lite` | `DanbooruTagGalleryLiteNode` | Browses Danbooru posts (tag search, rating, paging), pick posts for images + prompts.<br>Outputs: `images` (list), `prompts` (list), `merged_prompt` |
 | `Danbooru Tag Toolkit - Artist Lookup` | `DanbooruArtistLookupNode` | Resolves artist tags from a post source URL, an artist page URL or the original file md5.<br>Outputs: `artist_tags`, `artists` (list), `source`, `post_id`, `matched_by` |
 | `Danbooru Tag Toolkit - Specific Tag Cleaner` | `DanbooruTagSpecificCleanerNode` | Removes tags covered by a more specific tag (`jacket` vs `white jacket`).<br>Outputs: `cleaned_prompt`, `removed_tags`, `cleaned_prompt_list`, `removed_tags_list` |
+| `Danbooru Tag Toolkit - PixAI Tagger` | `DanbooruPixAITaggerNode` | Tags local images with PixAI Tagger v1.0 (30,877 Danbooru tags, six categories).<br>Outputs: `tags` (list), `merged_tags`, `scores_json` |
 | `Danbooru Tag Toolkit - Dataset Saver` | `DanbooruDatasetSaverNode` | Saves images with matching `.txt` caption files (optional previews, optional embedded workflow). |
 | `Toolkit Prompt Selector` | `DanbooruPromptSelector` | Local prompt library: categories, preview images, search, batch operations; exposes a side preview panel. |
 | `Toolkit Prompt Mixer` | `DanbooruPromptMixerNode` | Mixes / reorders / weights prompt fragments into one text output. |
@@ -48,6 +50,19 @@ pip install -r requirements.txt
 ```
 
 3. Restart ComfyUI, then hard-refresh the browser (`Ctrl+F5`) after updates.
+
+`transformers` and `timm` are only needed by the PixAI Tagger node; the rest of the toolkit works
+without them. That node also needs its weights, see [PixAI Tagger](#pixai-tagger).
+
+## Running the tests
+
+```powershell
+$env:PYTHONPATH="$PWD/tests"; pytest tests     # PowerShell, from this folder
+PYTHONPATH=tests pytest tests                  # bash
+```
+
+`tests/sitecustomize.py` stubs ComfyUI's runtime so the node package can be imported outside ComfyUI.
+`pytest` on its own would pick up ComfyUI's own test paths, so pass `tests` explicitly.
 
 ## Quick Start
 
@@ -132,6 +147,74 @@ Notes:
 - URLs are normalized before matching (`/en/` prefix, trailing slash, `#fragment`, host case).
 - A `403 Forbidden` from Danbooru is usually Cloudflare rate limiting: the node reports it as a temporary limit and
   falls back to a plain request when only the custom `User-Agent` was rejected.
+
+## PixAI Tagger
+
+`Danbooru Tag Toolkit - PixAI Tagger` tags your own images with [PixAI Tagger v1.0](https://huggingface.co/pixai-labs/pixai-tagger-v1.0)
+(30,877 Danbooru tags in six categories), so the toolkit works offline on local files instead of only on
+Danbooru posts.
+
+### Install the model
+
+The node reads `ComfyUI/models/taggers/<name>/`. Download the weights once:
+
+```bash
+hf download pixai-labs/pixai-tagger-v1.0 --local-dir ComfyUI/models/taggers/pixai-tagger-v1.0
+```
+
+If huggingface.co is blocked, set `HF_ENDPOINT=https://hf-mirror.com` (or download the same files with any
+other tool) before running that command. Only `config.json`, `preprocessor_config.json` and
+`model.safetensors` are required: the model's code is vendored in `vendor/pixai_tagger/`, so the node never
+executes code that came with the weights and never downloads anything itself.
+
+Optional: `python scripts/convert_pixai_tagger_bf16.py ComfyUI/models/taggers/pixai-tagger-v1.0` writes a
+bfloat16 copy next to it (1.9 GB -> 0.9 GB, identical results, faster first load).
+
+### Inputs
+
+| Input | Default | Notes |
+|---|---|---|
+| `model` | first folder found | every folder under `models/taggers/` with `config.json` + a `.safetensors` file |
+| `device` / `dtype` | `auto` | `auto` uses ComfyUI's device, bfloat16 on CUDA and float32 on CPU |
+| `threshold_general` / `character` / `copyright` / `style` / `meta` / `rating` | `0.17` / `0.27` / `0.24` / `0.15` / `0.17` / `0.41` | the model card's per-category macro-F1 values |
+| `exclude_categories` | `meta, rating` | keeps `highres`, `rating:s`, ... out of dataset captions |
+| `sort_by` | `category` | `category` = model group order, `score` = most confident first |
+| `max_tags_per_category` | `0` | `0` keeps every tag above the threshold |
+| `replace_underscore` | off | keep it off: the workbook matches Danbooru's underscore tags |
+| `free_after_run` | off | frees the tagger's ~1.1 GB when it competes with the checkpoint for VRAM |
+
+### Outputs
+
+| Output | Type | Use |
+|---|---|---|
+| `tags` | STRING list, one entry per image | `Dataset Saver` captions, or per image into `All-in-One` |
+| `merged_tags` | STRING | one call into `All-in-One` or `CLIPTextEncode` |
+| `scores_json` | STRING list | per-image `{"general": {"1girl": 0.98}}` for filtering or your own UI |
+
+Tags are emitted as native Danbooru tags with parentheses escaped (`artoria_pendragon_\(fate\)`), exactly like
+the gallery's `prompts` output, so the sorter, the cleaner and the prompt nodes parse them unchanged.
+
+### Workflows
+
+1. **Caption a dataset**: `Gallery Lite.images` (or `LoadImage`) -> `PixAI Tagger` -> `Dataset Saver.prompts`
+   writes `image.png` + `image.txt` pairs.
+2. **Prompt from a reference image**: `LoadImage` -> `PixAI Tagger.merged_tags` -> `All-in-One.tags`, then pick
+   the rows you want in the node UI.
+3. **Artist tags**: the model's `style` category contains artist tags, so they land in 画师词 like any other
+   artist tag.
+
+The tagger has no UI of its own: `All-in-One` is the place to review, filter and select what it produced.
+
+### Notes
+
+- Cost: ~1.1 GB VRAM in bfloat16 and about 0.25 s per 1008x1008 image on an RTX 5060 Laptop; the first call
+  also loads the checkpoint (~2 s warm, longer on a cold disk cache). `fp32` is 2.1 GB / ~0.75 s.
+- Images are resized to fit 1008x1008 and centre padded, never stretched.
+- 94.8% of the model's tags are already in `tags_database/danbooru_tags.xlsx`. The remaining 1,602 (mostly
+  characters and copyrights) fall into 未归类词 until they are added; `python scripts/report_missing_tags.py`
+  writes them to `tags_database/reports/missing_tags.csv`.
+- `rating` uses Danbooru's own `rating:g` / `rating:s` / `rating:q` / `rating:e`.
+- Thresholds are image dependent; treat the defaults as starting points and lower them for more, noisier tags.
 
 ## Tag Database
 
@@ -223,6 +306,7 @@ So existing Chinese workflows keep working, and English-based presets can also b
 
 - All Danbooru access is anonymous; no API key is required and nothing is uploaded.
 - The only outbound requests are to `danbooru.donmai.us` (API + images) issued from your own ComfyUI server.
+  The PixAI Tagger node is fully offline: you download its weights yourself.
 - Danbooru API calls are throttled to 1 request/second and cached (posts 2 min, autocomplete 5 min, artist lookups 15 min).
 - Image bytes are streamed through the local server instead of being embedded from the CDN in the browser.
 - Prompt-library data stays in `prompt_selector/data.json` inside this node folder.
@@ -235,6 +319,8 @@ So existing Chinese workflows keep working, and English-based presets can also b
 | A card shows `Retry` | The thumbnail could not be fetched after retries - click `Retry`; the post itself stays selected/usable. |
 | Images look cropped | Check the canvas zoom; the gallery now compensates for it. If it still happens, please report the post URL. |
 | Pasting a URL finds nothing | That artwork was likely never uploaded to Danbooru; the status line will say so. |
+| PixAI Tagger says `weights not found` | The `model` dropdown only lists folders in `ComfyUI/models/taggers/` that contain `config.json` + a `.safetensors` file. Download the weights there and hard-refresh so the node list rebuilds. |
+| PixAI Tagger runs out of VRAM next to the checkpoint | Turn on `free_after_run` (releases ~1.1 GB after each run) or set `device=cpu` (slower). |
 | Node UI looks stale after updating | Hard-refresh the browser (`Ctrl+F5`) and restart ComfyUI. |
 
 ## Changelog

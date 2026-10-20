@@ -3,6 +3,11 @@ import os
 from typing import Any, List
 
 DEFAULT_PREVIEW_LIMIT = 24
+# Workflows saved while this node had a boolean preview widget send True/False here; keep accepting
+# them so those prompts still validate instead of failing with "Value not in list".
+PREVIEW_MODE_OPTIONS = ["auto", "off", "on", True, False]
+PREVIEW_MODE_OFF = {"off", "false", "0", "no"}
+PREVIEW_MODE_ON = {"on", "true", "1", "yes"}
 
 
 def _first_scalar(value: Any, default: str = "") -> str:
@@ -89,9 +94,9 @@ def _as_int(value: Any, default: int) -> int:
 
 def _should_return_previews(preview_mode: Any, image_count: int, preview_limit: Any) -> bool:
     mode = _first_scalar(preview_mode, "auto").strip().lower()
-    if mode == "off":
+    if mode in PREVIEW_MODE_OFF:
         return False
-    if mode == "on":
+    if mode in PREVIEW_MODE_ON:
         return True
 
     limit = max(0, _as_int(preview_limit, DEFAULT_PREVIEW_LIMIT))
@@ -114,7 +119,7 @@ class DanbooruDatasetSaverNode:
                 "prompts": ("STRING", {"forceInput": True, "multiline": True}),
                 "filename_prefix": ("STRING", {"default": "danbooru/data"}),
                 "caption_mode": (["overwrite", "new only"], {"default": "overwrite"}),
-                "preview_mode": (["auto", "off", "on"], {"default": "auto"}),
+                "preview_mode": (PREVIEW_MODE_OPTIONS, {"default": "auto"}),
                 "preview_limit": ("INT", {"default": DEFAULT_PREVIEW_LIMIT, "min": 0, "max": 500, "step": 1}),
                 "embed_workflow": ("BOOLEAN", {"default": False}),
             },

@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **PixAI Tagger node** (`DanbooruPixAITaggerNode`): tags local images with PixAI Tagger v1.0
+  (30,877 Danbooru tags in six categories) and feeds the existing sorter / dataset tools.
+  Outputs `tags` (one string per image), `merged_tags` and `scores_json`; per-category thresholds and
+  category filtering, score or category ordering, per-category cap, optional VRAM release.
+- Vendored the model's `tagger_pipeline.py` (unmodified, Apache-2.0, revision recorded in
+  `vendor/pixai_tagger/README.md`) so the node loads a checkpoint without `trust_remote_code`.
+- `scripts/convert_pixai_tagger_bf16.py`: bfloat16 copy of the checkpoint (1.9 GB -> 0.9 GB).
+- `scripts/report_missing_tags.py`: lists the model tags the workbook cannot classify yet
+  (`tags_database/reports/missing_tags.csv`, 1,602 tags today).
+- The test suite runs outside ComfyUI now: `tests/sitecustomize.py` stubs `server` / `comfy` /
+  `folder_paths` at interpreter start and `pytest.ini` sets `--import-mode=importlib`, so
+  `PYTHONPATH=tests pytest tests` collects both test modules.
+
+### Fixed
+
+- `Dataset Saver` no longer fails prompt validation with `Value not in list: preview_mode: False`. Workflows
+  saved while that widget was a boolean are accepted again (`True`/`False` are mapped to `on`/`off`).
+
 ## 1.2.0 - 2026-09-15
 
 ### Added

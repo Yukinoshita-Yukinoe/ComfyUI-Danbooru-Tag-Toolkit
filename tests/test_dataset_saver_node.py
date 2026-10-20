@@ -7,10 +7,12 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dataset_saver_node import (  # noqa: E402
+    PREVIEW_MODE_OPTIONS,
     DanbooruDatasetSaverNode,
     _build_saved_file_name,
     _caption_path_for_image,
     _normalize_prompts,
+    _should_return_previews,
 )
 
 
@@ -105,4 +107,25 @@ def test_dataset_saver_auto_disables_preview_above_limit(tmp_path):
     )
 
     assert (tmp_path / "kiss" / "data_00002_.png").exists()
+    assert result["ui"]["images"] == []
+
+
+def test_dataset_saver_accepts_the_legacy_boolean_preview_mode(tmp_path):
+    _install_fake_folder_paths(tmp_path)
+    image = FakeTensor(np.zeros((2, 2, 3), dtype=np.float32))
+
+    assert False in PREVIEW_MODE_OPTIONS
+    assert _should_return_previews(False, 1, 24) is False
+    assert _should_return_previews(True, 1, 24) is True
+
+    node = DanbooruDatasetSaverNode()
+    result = node.save_dataset(
+        images=[image],
+        prompts=["1girl"],
+        filename_prefix="kiss/data",
+        caption_mode="overwrite",
+        preview_mode=False,
+    )
+
+    assert (tmp_path / "kiss" / "data_00001_.png").exists()
     assert result["ui"]["images"] == []
