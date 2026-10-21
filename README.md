@@ -36,6 +36,7 @@ artist tags from external URLs, and manage a personal prompt library.
 | `Danbooru Tag Toolkit - Artist Lookup` | `DanbooruArtistLookupNode` | Resolves artist tags from a post source URL, an artist page URL or the original file md5.<br>Outputs: `artist_tags`, `artists` (list), `source`, `post_id`, `matched_by` |
 | `Danbooru Tag Toolkit - Specific Tag Cleaner` | `DanbooruTagSpecificCleanerNode` | Removes tags covered by a more specific tag (`jacket` vs `white jacket`).<br>Outputs: `cleaned_prompt`, `removed_tags`, `cleaned_prompt_list`, `removed_tags_list` |
 | `Danbooru Tag Toolkit - PixAI Tagger` | `DanbooruPixAITaggerNode` | Tags local images with PixAI Tagger v1.0 (30,877 Danbooru tags, six categories).<br>Outputs: `tags` (list), `merged_tags`, `scores_json` |
+| `Danbooru Tag Toolkit - Lineart Trace` | `DanbooruLineartTraceNode` | Retraces black line art into smooth antialiased curves (Potrace), transparent background by default.<br>Outputs: `image` |
 | `Danbooru Tag Toolkit - Dataset Saver` | `DanbooruDatasetSaverNode` | Saves images with matching `.txt` caption files (optional previews, optional embedded workflow). |
 | `Toolkit Prompt Selector` | `DanbooruPromptSelector` | Local prompt library: categories, preview images, search, batch operations; exposes a side preview panel. |
 | `Toolkit Prompt Mixer` | `DanbooruPromptMixerNode` | Mixes / reorders / weights prompt fragments into one text output. |
@@ -53,6 +54,9 @@ pip install -r requirements.txt
 
 `transformers` and `timm` are only needed by the PixAI Tagger node; the rest of the toolkit works
 without them. That node also needs its weights, see [PixAI Tagger](#pixai-tagger).
+
+`potracer` is only needed by the Lineart Trace node. It is listed in `requirements.txt`, but the
+package also loads without it: the node then reports `pip install potracer` instead of failing.
 
 ## Running the tests
 
@@ -215,6 +219,44 @@ The tagger has no UI of its own: `All-in-One` is the place to review, filter and
   writes them to `tags_database/reports/missing_tags.csv`.
 - `rating` uses Danbooru's own `rating:g` / `rating:s` / `rating:q` / `rating:e`.
 - Thresholds are image dependent; treat the defaults as starting points and lower them for more, noisier tags.
+
+## Lineart Trace
+
+`Danbooru Tag Toolkit - Lineart Trace` smooths black line art: it binarizes the image, retraces the
+shapes with [Potrace](https://potrace.sourceforge.net/), and renders the resulting curves back to an
+antialiased image (transparent by default). Useful after an AI lineart / coloring pass whose lines are
+jagged, or to clean a sketch before a ControlNet or img2img run.
+
+Needs the optional `potracer` package (pure Python): `pip install potracer`.
+
+### Inputs
+
+| Input | Default | Notes |
+|---|---|---|
+| `threshold` | `0.70` | pixels darker than this count as line; raise it when thin lines disappear |
+| `despeckle` | `3` | area of the specks Potrace drops; lower it when fine details vanish |
+| `smoothness` | `1.0` | `0` keeps hard corners, higher values round them (Potrace's `alphamax`) |
+| `antialias` | `3` | internal render scale, independent of `output_scale` |
+| `pre_blur` | `0.0` | Gaussian radius applied before binarizing |
+| `median_filter` | off | 3x3 median, suppresses noise; leave it off if thin lines disappear |
+| `output_scale` | `1` | output size multiplier (`2` turns 1024x1536 into 2048x3072) |
+| `transparent_background` | on | lines become alpha; turn it off for black-on-white |
+
+### Output
+
+`image` is `RGBA` when `transparent_background` is on (black pixels + alpha, so `Save Image` writes a
+transparent PNG) and `RGB` when it is off. A batch is processed frame by frame.
+
+### Notes
+
+- ~2 s for a 1024x1536 line art on CPU; cost grows with `antialias` and `output_scale` squared.
+- Potrace traces the shapes it is given; it cannot recover detail that the binarization already lost.
+  Lower `threshold` or disable `median_filter` first when lines break up.
+- This node is an independent implementation: `potracer` does the curve fitting and the rendering uses
+  Pillow, so no third-party source is vendored. `potracer` is GPLv2+ and is shipped as a dependency, not
+  as part of this MIT package. Compared with the original
+  [ComfyUI-potrace_Line](https://github.com/tori29umai0123/ComfyUI-potrace_Line) on its example image, the
+  output differs by 0.62/255 on average (0.46% of pixels differ by more than 32).
 
 ## Tag Database
 

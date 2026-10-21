@@ -4,3 +4,6 @@ Pillow
 # PixAI Tagger node; torch/torchvision come with ComfyUI and must not be pinned here.
 transformers>=4.56
 timm>=1.0
+# Lineart Trace node. Optional at runtime (the node reports how to install it), and GPLv2+ itself,
+# so it stays a dependency instead of vendored code.
+potracer>=0.0.4

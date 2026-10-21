@@ -16,6 +16,11 @@
 - The test suite runs outside ComfyUI now: `tests/sitecustomize.py` stubs `server` / `comfy` /
   `folder_paths` at interpreter start and `pytest.ini` sets `--import-mode=importlib`, so
   `PYTHONPATH=tests pytest tests` collects both test modules.
+- **Lineart Trace node** (`DanbooruLineartTraceNode`): retraces black line art into smooth curves with
+  Potrace and renders an antialiased image, transparent by default; same parameters as
+  [ComfyUI-potrace_Line](https://github.com/tori29umai0123/ComfyUI-potrace_Line) so existing values carry over.
+  `potracer` is an optional, lazily imported dependency (GPLv2+, not vendored) and the rendering is done
+  with Pillow, which also drops the original's `aggdraw` compiled dependency.
 
 ### Fixed
 
