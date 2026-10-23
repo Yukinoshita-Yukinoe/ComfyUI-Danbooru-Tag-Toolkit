@@ -249,7 +249,8 @@ const documentStub = {
 };
 globalThis.document = documentStub;
 globalThis.requestAnimationFrame = handler => { handler(); return 0; };
-globalThis.setInterval = () => 0;
+const intervalHandlers = [];
+globalThis.setInterval = handler => { intervalHandlers.push(handler); return intervalHandlers.length; };
 globalThis.setTimeout = () => 0;
 globalThis.clearTimeout = () => {};
 globalThis.window = { prompt: () => null, confirm: () => true };
@@ -395,6 +396,35 @@ await checkAsync("a selected node without presets can save its first one", async
     const stored = writes.at(-1)?.data?.groups?.["CLIPTextEncode::正面提示词"];
     assert.ok(stored, "the first preset is stored");
     assert.equal(stored.presets[0].name, "默认");
+});
+
+
+await checkAsync("re-selecting the same node does not rebuild the list", async () => {
+    const state = host.__dntpState;
+    const marker = state.body.children[0];
+
+    appStub.canvas.onSelectionChange();
+    assert.equal(state.body.children[0], marker, "an unchanged selection is ignored");
+
+    appStub.canvas.selected_nodes = { 11: sampleNode, 55: fakeNode({ id: 55, type: "VAEDecode", title: "VAEDecode" }) };
+    appStub.canvas.onSelectionChange();
+    assert.notEqual(state.body.children[0], marker, "a new selection redraws the panel");
+});
+
+await checkAsync("a panel left behind by a tab switch is dropped, not refreshed", async () => {
+    const state = host.__dntpState;
+    const marker = state.body.children[0];
+
+    host.isConnected = false;
+    appStub.canvas.selected_nodes = {};
+    appStub.canvas.onSelectionChange();
+    assert.equal(state.body.children[0], marker, "a detached panel is not redrawn");
+
+    intervalHandlers.forEach(handler => handler());   // the tick reaps it
+    host.isConnected = true;
+    appStub.graph._nodes = [sampleNode, fakeNode({ id: 77, type: "KSampler", title: "新节点" })];
+    intervalHandlers.forEach(handler => handler());
+    assert.equal(state.body.children[0], marker, "once reaped it stays gone, so detached DOM cannot pile up");
 });
 
 if (failures.length) {

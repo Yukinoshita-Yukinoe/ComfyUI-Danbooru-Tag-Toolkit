@@ -465,7 +465,8 @@ function buildChrome(state) {
 function render(state) {
     const nodes = canvasNodes();
     const selected = selectedNodes(app.canvas);
-    state.signature = `${nodeSignature(nodes)}#${selectionSignature(selected)}`;
+    state.selectionKey = selectionSignature(selected);
+    state.signature = `${nodeSignature(nodes)}#${state.selectionKey}`;
     const body = state.body;
     body.textContent = "";
 
@@ -588,16 +589,25 @@ app.registerExtension({
             const previousSelectionChange = canvas.onSelectionChange;
             canvas.onSelectionChange = function (...args) {
                 const result = previousSelectionChange?.apply(this, args);
-                for (const panel of panels) scheduleRender(panel);
+                const selectionKey = selectionSignature(selectedNodes(app.canvas));
+                for (const panel of panels) {
+                    if (panel.element.isConnected && panel.selectionKey !== selectionKey) scheduleRender(panel);
+                }
                 return result;
             };
         }
 
         // The canvas changes without telling the sidebar, so poll cheaply while it is on screen.
         setInterval(() => {
-            for (const panel of panels) {
-                if (!panel.element.isConnected) continue;
-                const signature = `${nodeSignature(canvasNodes())}#${selectionSignature(selectedNodes(app.canvas))}`;
+            if (!panels.size) return;
+            const signature = `${nodeSignature(canvasNodes())}#${selectionSignature(selectedNodes(app.canvas))}`;
+            for (const panel of [...panels]) {
+                // Switching sidebar tabs unmounts this element; dropping the state keeps the detached DOM
+                // from piling up across tab switches.
+                if (!panel.element.isConnected) {
+                    panels.delete(panel);
+                    continue;
+                }
                 if (panel.signature !== signature) scheduleRender(panel);
             }
         }, REFRESH_INTERVAL);
