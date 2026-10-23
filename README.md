@@ -42,6 +42,30 @@ artist tags from external URLs, and manage a personal prompt library.
 | `Toolkit Prompt Selector` | `DanbooruPromptSelector` | Local prompt library: categories, preview images, search, batch operations; exposes a side preview panel. |
 | `Toolkit Prompt Mixer` | `DanbooruPromptMixerNode` | Mixes / reorders / weights prompt fragments into one text output. |
 
+## Node Presets sidebar
+
+Not a node: a sidebar tab (the bookmark icon, `参数预设`) for keeping several parameter sets per node and
+switching between them. A node with five dials you keep re-tuning for different styles can hold one preset
+per style instead of one saved workflow per style.
+
+- Presets are grouped by **node type + the node's title**, so two `KSampler`s named `人物` and `背景` keep
+  separate sets, while any node you name the same way on another workflow shares them.
+- The tab lists only nodes of the current workflow that already have presets. Turn off `只显示当前工作流`
+  to see (and clean up) presets from other workflows.
+- `＋ 记录当前` asks for a name and shows a checkbox per widget, so you can leave out things like a file
+  path that means nothing on another machine. `更新` re-captures the same selection from the current node.
+- Clicking a preset writes its values back. Values that no longer work are skipped and reported: a combo
+  whose entry is gone (deleted checkpoint) is left alone instead of breaking the queue with
+  `Value not in list`, and a widget fed by a link is called out because the upstream value wins.
+- Presets live in `ComfyUI/user/default/node_presets.json` (through ComfyUI's user data API), so they are
+  shared by every workflow, survive a browser cache wipe, and follow the ComfyUI user. `导出` / `导入`
+  move them between machines.
+
+Why not the alternatives: `ComfyUI-NodePresets` offers the same idea in a right-click menu (no sidebar, one
+shared list per node type, no value validation), `comfyui-preset-switch-plus` stores whole-workflow presets
+inside the workflow file (so they do not travel between workflows), and the built-in node templates are for
+*creating* nodes rather than re-valuing an existing one.
+
 ## Installation
 
 1. Clone or copy this repo into ComfyUI `custom_nodes`.

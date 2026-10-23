@@ -4,6 +4,12 @@
 
 ### Added
 
+- **Node Presets sidebar** (`参数预设`, bookmark icon): saves several parameter sets per node and brings
+  them back with one click, across workflows. Groups are keyed by node type plus the node's title, only the
+  current workflow's nodes are listed, and presets are stored in `user/default/node_presets.json` through
+  ComfyUI's user data API. Recording shows a checkbox per widget so file paths and embedded blobs can stay
+  out; applying skips values that are no longer valid (a removed combo entry) or that a link overrides, and
+  says so in the panel instead of breaking the queue.
 - **Tag Add / Remove node** (`DanbooruTagAddRemoveNode`): adds the tags a prompt is missing and drops the
   ones you list, leaving everything else as it arrived. New tags go at the end unless `add_to_front` is on.
   Tag matching is shared with the rest of the toolkit (case-insensitive, `_` equals a space, escaped
