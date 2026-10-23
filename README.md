@@ -35,6 +35,7 @@ artist tags from external URLs, and manage a personal prompt library.
 | `Danbooru Tag Toolkit - Danbooru Gallery Lite` | `DanbooruTagGalleryLiteNode` | Browses Danbooru posts (tag search, rating, paging), pick posts for images + prompts.<br>Outputs: `images` (list), `prompts` (list), `merged_prompt` |
 | `Danbooru Tag Toolkit - Artist Lookup` | `DanbooruArtistLookupNode` | Resolves artist tags from a post source URL, an artist page URL or the original file md5.<br>Outputs: `artist_tags`, `artists` (list), `source`, `post_id`, `matched_by` |
 | `Danbooru Tag Toolkit - Specific Tag Cleaner` | `DanbooruTagSpecificCleanerNode` | Removes tags covered by a more specific tag (`jacket` vs `white jacket`).<br>Outputs: `cleaned_prompt`, `removed_tags`, `cleaned_prompt_list`, `removed_tags_list` |
+| `Danbooru Tag Toolkit - Tag Add / Remove` | `DanbooruTagAddRemoveNode` | Adds tags the prompt is missing and removes the ones you list.<br>Outputs: `prompt`, `added_tags`, `removed_tags` |
 | `Danbooru Tag Toolkit - PixAI Tagger` | `DanbooruPixAITaggerNode` | Tags local images with PixAI Tagger v1.0 (30,877 Danbooru tags, six categories).<br>Outputs: `tags` (list), `merged_tags`, `scores_json` |
 | `Danbooru Tag Toolkit - Lineart Trace` | `DanbooruLineartTraceNode` | Retraces black line art into smooth antialiased curves (Potrace), transparent background by default.<br>Outputs: `image` |
 | `Danbooru Tag Toolkit - Dataset Saver` | `DanbooruDatasetSaverNode` | Saves images with matching `.txt` caption files (optional previews, optional embedded workflow). |
@@ -151,6 +152,39 @@ Notes:
 - URLs are normalized before matching (`/en/` prefix, trailing slash, `#fragment`, host case).
 - A `403 Forbidden` from Danbooru is usually Cloudflare rate limiting: the node reports it as a temporary limit and
   falls back to a plain request when only the custom `User-Agent` was rejected.
+
+## Tag Add / Remove
+
+`Danbooru Tag Toolkit - Tag Add / Remove` patches a prompt on the way through the graph: tags you list in
+`add_tags` are appended when the prompt does not have them yet, and tags you list in `remove_tags` are
+deleted when it does. Anything else is passed through untouched.
+
+| Input | Default | Notes |
+|---|---|---|
+| `prompt` | empty | the prompt to patch; connect a string or type one |
+| `add_tags` | empty | comma or newline separated; already-present tags are skipped |
+| `remove_tags` | empty | comma or newline separated; absent tags change nothing |
+| `add_to_front` | off | on = new tags go to the front instead of the end |
+
+Outputs: `prompt` (the patched prompt), `added_tags` and `removed_tags` (what actually changed, in prompt
+order, for logging or a second branch).
+
+How tags are matched, shared with the rest of the toolkit:
+
+- case-insensitive, and `long_hair` is the same tag as `long hair`
+- `(tag)` / `((tag))` weights are wrappers, not part of the name
+- `utdr_\(toby_fox\)` and `utdr_(toby_fox)` are the same tag
+- `(long hair, blue eyes:1.2)` counts as both inner tags; removing one keeps the group and its weight,
+  removing both drops the group
+- a tag in both boxes ends up **removed** (the remove box wins)
+- when nothing matches, the prompt is returned byte for byte, so it can sit in a graph without reformatting
+
+```
+prompt:  1girl, solo, long hair
+add:     smile
+remove:  solo
+result: 1girl, long hair, smile
+```
 
 ## PixAI Tagger
 

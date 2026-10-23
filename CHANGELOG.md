@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Tag Add / Remove node** (`DanbooruTagAddRemoveNode`): adds the tags a prompt is missing and drops the
+  ones you list, leaving everything else as it arrived. New tags go at the end unless `add_to_front` is on.
+  Tag matching is shared with the rest of the toolkit (case-insensitive, `_` equals a space, escaped
+  parentheses match their bare form, a weighted group counts as its inner tags), and a tag listed in both
+  boxes ends up removed.
+
 ## 1.3.1 - 2026-10-23
 
 ### Added
