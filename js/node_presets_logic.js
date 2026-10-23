@@ -206,6 +206,23 @@ export function matchGroups(store, nodes) {
     return { matched: [...matched.values()], others };
 }
 
+// The canvas keeps the current selection as an id -> node map; the sidebar always lists those nodes so
+// a node without presets still has somewhere to save its first one.
+export function selectedNodes(canvas) {
+    const selection = canvas?.selected_nodes;
+    if (!selection || typeof selection !== "object") return [];
+    return Object.values(selection).filter(node => node && typeof node === "object");
+}
+
+export function selectionSignature(nodes) {
+    return (nodes ?? []).map(node => node?.id).filter(id => id !== undefined).sort().join(",");
+}
+
+export function groupFor(store, node) {
+    const key = nodeGroupKey(node);
+    return store?.groups?.[key] ?? { nodeType: node?.type ?? "", title: node?.title ?? "", presets: [] };
+}
+
 export function nodeSignature(nodes) {
     return (nodes ?? []).map(node => `${node.id}:${node.type}:${node.title}`).join("|");
 }

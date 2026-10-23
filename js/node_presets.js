@@ -18,8 +18,11 @@ import {
     nodeSignature,
     normalizeStore,
     planApply,
+    groupFor,
     removePreset,
     renamePreset,
+    selectedNodes,
+    selectionSignature,
     uniquePresetName,
     upsertPreset,
     valuesSummary,
@@ -371,6 +374,9 @@ function buildCard(state, entry, foreign) {
     }
     card.appendChild(head);
 
+    if (!entry.group.presets.length) {
+        card.appendChild(make("div", "dntp-empty", "还没有预设，点右上「＋ 记录当前」保存第一套。"));
+    }
     for (const preset of entry.group.presets) {
         card.appendChild(buildPresetRow(state, entry.key, entry.group, entry.nodes, preset, foreign));
     }
@@ -458,23 +464,45 @@ function buildChrome(state) {
 
 function render(state) {
     const nodes = canvasNodes();
-    state.signature = nodeSignature(nodes);
+    const selected = selectedNodes(app.canvas);
+    state.signature = `${nodeSignature(nodes)}#${selectionSignature(selected)}`;
     const body = state.body;
     body.textContent = "";
 
     const { matched, others } = matchGroups(store, nodes);
     const needle = state.filter.trim().toLowerCase();
-    const visible = matched.filter(entry => !needle
-        || (entry.group.title ?? "").toLowerCase().includes(needle)
-        || entry.nodes.some(node => String(node.type).toLowerCase().includes(needle))
-        || entry.group.presets.some(preset => preset.name.toLowerCase().includes(needle)));
+    const matches = (title, types, presets) => !needle
+        || (title ?? "").toLowerCase().includes(needle)
+        || types.some(type => String(type).toLowerCase().includes(needle))
+        || presets.some(preset => preset.name.toLowerCase().includes(needle));
 
-    if (!visible.length) {
+    // Always show the selection: a node with no presets yet needs the record button here, otherwise the
+    // first preset could never be saved.
+    const selectedKeys = new Set();
+    const selectedShown = selected.filter(node => {
+        const keep = matches(node.title, [node.type], groupFor(store, node).presets);
+        if (keep) selectedKeys.add(nodeGroupKey(node));
+        return keep;
+    });
+    if (selectedShown.length) {
+        body.appendChild(make("div", "dntp-section", "已选中"));
+        for (const node of selectedShown) {
+            body.appendChild(buildCard(state, { key: nodeGroupKey(node), group: groupFor(store, node), nodes: [node] }, false));
+        }
+    }
+
+    const visible = matched.filter(entry => !selectedKeys.has(entry.key)
+        && matches(entry.group.title, entry.nodes.map(node => node.type), entry.group.presets));
+
+    if (!selectedShown.length && !visible.length) {
         const empty = make("div", "dntp-empty");
         empty.textContent = Object.keys(store.groups).length
-            ? "当前工作流里的节点还没有保存过预设。选中一个节点，用它的「＋ 记录当前」保存第一套。"
-            : "还没有任何预设。选中节点后点「＋ 记录当前」保存第一套参数。";
+            ? "在画布上选中一个节点，这里就会出现它的「＋ 记录当前」按钮。"
+            : "在画布上选中一个节点，然后点它的「＋ 记录当前」保存第一套参数。";
         body.appendChild(empty);
+    }
+    if (visible.length && selectedShown.length) {
+        body.appendChild(make("div", "dntp-section", "本工作流其它节点"));
     }
     for (const entry of visible) body.appendChild(buildCard(state, entry, false));
 
@@ -555,11 +583,22 @@ app.registerExtension({
             render: renderSidebarTab,
         });
 
+        const canvas = app.canvas;
+        if (canvas) {
+            const previousSelectionChange = canvas.onSelectionChange;
+            canvas.onSelectionChange = function (...args) {
+                const result = previousSelectionChange?.apply(this, args);
+                for (const panel of panels) scheduleRender(panel);
+                return result;
+            };
+        }
+
         // The canvas changes without telling the sidebar, so poll cheaply while it is on screen.
         setInterval(() => {
             for (const panel of panels) {
                 if (!panel.element.isConnected) continue;
-                if (panel.signature !== nodeSignature(canvasNodes())) scheduleRender(panel);
+                const signature = `${nodeSignature(canvasNodes())}#${selectionSignature(selectedNodes(app.canvas))}`;
+                if (panel.signature !== signature) scheduleRender(panel);
             }
         }, REFRESH_INTERVAL);
     },

@@ -164,6 +164,25 @@ check("matchGroups separates current-workflow groups from the rest", () => {
     assert.deepEqual(others.map(entry => entry.key), ["VAEDecode::"]);
 });
 
+check("the selection is read from the canvas map and drives the signature", () => {
+    const nodeA = fakeNode({ id: 7, type: "KSampler", title: "人物" });
+    const nodeB = fakeNode({ id: 9, type: "VAEDecode", title: "VAEDecode" });
+
+    assert.deepEqual(logic.selectedNodes({ selected_nodes: { 7: nodeA } }), [nodeA]);
+    assert.deepEqual(logic.selectedNodes({}), []);
+    assert.deepEqual(logic.selectedNodes(undefined), []);
+    assert.equal(logic.selectionSignature([nodeA, nodeB]), "7,9");
+    assert.equal(logic.selectionSignature([]), "");
+});
+
+check("groupFor returns the stored group or an empty one for a fresh node", () => {
+    const store = logic.normalizeStore({ groups: { "KSampler::人物": { nodeType: "KSampler", title: "人物", presets: [{ name: "A", values: { steps: 1 } }] } } });
+
+    assert.equal(logic.groupFor(store, fakeNode({ type: "KSampler", title: "人物" })).presets.length, 1);
+    const fresh = logic.groupFor(store, fakeNode({ type: "KSampler", title: "背景" }));
+    assert.deepEqual(fresh, { nodeType: "KSampler", title: "背景", presets: [] });
+});
+
 check("nodeSignature notices renames and new nodes", () => {
     const before = logic.nodeSignature([fakeNode({ id: 1, title: "A" })]);
     assert.equal(before, logic.nodeSignature([fakeNode({ id: 1, title: "A" })]));
@@ -260,7 +279,7 @@ const sampleNode = fakeNode({
 const appStub = {
     storageLocation: "server",
     graph: { _nodes: [sampleNode], change() {} },
-    canvas: { centerOnNode() {}, selectNode() {} },
+    canvas: { centerOnNode() {}, selectNode() {}, selected_nodes: {}, onSelectionChange: null },
     extensionManager: { registerSidebarTab: tab => { appStub.registeredTab = tab; } },
     extensions: [],
     registerExtension(extension) { this.extensions.push(extension); },
@@ -343,15 +362,39 @@ await checkAsync("recording the current values keeps only the checked widgets", 
 });
 
 await checkAsync("turning the filter off reveals presets from other workflows", async () => {
-    const box = host.findByClass("dntp-card") && host.descendants().find(element => element.tagName === "input" && element.type === "checkbox" && element.checked);
-    assert.ok(box, "the current-workflow filter starts enabled");
+    const label = host.descendants().find(element => element.tagName === "label" && element.textContent.includes("只显示当前工作流"));
+    const box = label.children[0];
+    assert.equal(box.checked, true, "the current-workflow filter starts enabled");
     box.checked = false;
     box.dispatch("change");
 
     const cards = host.findAllByClass("dntp-card");
-    assert.equal(cards.length, 2, "the foreign group is listed too");
+    assert.ok(cards.length >= 2, "the foreign group is listed too");
     assert.ok(cards.some(card => card.classList.contains("foreign")));
-    assert.ok(host.findByClass("dntp-section").textContent.includes("其它工作流"));
+    const sections = host.findAllByClass("dntp-section").map(section => section.textContent);
+    assert.ok(sections.some(text => text.includes("其它工作流")), `expected a foreign section, got ${JSON.stringify(sections)}`);
+});
+
+
+await checkAsync("a selected node without presets can save its first one", async () => {
+    const fresh = fakeNode({ id: 21, type: "CLIPTextEncode", title: "正面提示词", widgets: [widget("text", "1girl")] });
+    appStub.graph._nodes = [sampleNode, fresh];
+    appStub.canvas.selected_nodes = { 21: fresh };
+    host.findButton("刷新").click();
+
+    const card = host.findAllByClass("dntp-card").find(item => item.textContent.includes("正面提示词"));
+    assert.ok(card, "the selected node is listed even with no presets");
+    assert.ok(card.textContent.includes("还没有预设"), "the card says how to save the first one");
+
+    card.findButton("＋ 记录当前").click();
+    const overlay = documentStub.body.children.filter(element => element.classList.contains("dntp-overlay")).at(-1);
+    assert.ok(overlay, "the record dialog opens for an unrecorded node");
+    overlay.findByClass("dntp-input").value = "默认";
+    overlay.findButton("保存").click();
+
+    const stored = writes.at(-1)?.data?.groups?.["CLIPTextEncode::正面提示词"];
+    assert.ok(stored, "the first preset is stored");
+    assert.equal(stored.presets[0].name, "默认");
 });
 
 if (failures.length) {
