@@ -23,7 +23,9 @@ def _import_node_module():
 tagger_node = _import_node_module()
 
 DEFAULT_EXCLUDE_CATEGORIES = tagger_node.DEFAULT_EXCLUDE_CATEGORIES
-MISSING_MODEL_ENTRY = tagger_node.MISSING_MODEL_ENTRY
+DEFAULT_TAGGER_REPO = tagger_node.DEFAULT_TAGGER_REPO
+DEFAULT_TAGGER_NAME = tagger_node.DEFAULT_TAGGER_NAME
+MISSING_MODEL = "not-installed-model"
 DanbooruPixAITaggerNode = tagger_node.DanbooruPixAITaggerNode
 _flatten_images = tagger_node._flatten_images
 _list_tagger_models = tagger_node._list_tagger_models
@@ -52,7 +54,7 @@ def _fake_config():
 def _node_kwargs(**overrides):
     values = {
         "image": [torch.zeros(8, 8, 3)],
-        "model": [MISSING_MODEL_ENTRY],
+        "model": [MISSING_MODEL],
         "device": ["cpu"],
         "dtype": ["fp32"],
         "threshold_general": [0.17],
@@ -66,6 +68,8 @@ def _node_kwargs(**overrides):
         "max_tags_per_category": [0],
         "replace_underscore": [False],
         "free_after_run": [False],
+        "auto_download": [False],
+        "download_repo": [DEFAULT_TAGGER_REPO],
     }
     values.update(overrides)
     return values
@@ -194,12 +198,94 @@ def test_resolve_tagger_dir_rejects_paths_outside_the_model_folder(tmp_path, tag
     assert _resolve_tagger_dir("../outside") == ""
     assert _resolve_tagger_dir(r"C:\Windows") == ""
     assert _resolve_tagger_dir("..") == ""
-    assert _resolve_tagger_dir(MISSING_MODEL_ENTRY) == ""
+    assert _resolve_tagger_dir(MISSING_MODEL) == ""
 
 
 def test_tag_reports_a_readable_error_when_the_model_is_missing(tagger_model_dirs):
     with pytest.raises(RuntimeError, match="models/taggers"):
         DanbooruPixAITaggerNode().tag(**_node_kwargs())
+
+
+def test_model_combo_offers_the_default_repo_before_it_is_downloaded(tagger_model_dirs):
+    # A workflow saved where the weights exist must still validate where they do not, or the node never
+    # gets a chance to download them.
+    assert DEFAULT_TAGGER_NAME in DanbooruPixAITaggerNode.INPUT_TYPES()["required"]["model"][0]
+
+
+class _FakeTagger:
+    """Returns one flat logit per tag so the tag assembly can be tested without weights."""
+
+    def __init__(self, config, logit=-10.0):
+        self.config = config
+        self.logit = logit
+
+    def __call__(self, pixels):
+        return torch.full((1, len(self.config.tags)), self.logit)
+
+
+def test_tag_downloads_the_model_on_first_run(monkeypatch, tmp_path, tagger_model_dirs):
+    tagger_model_dirs.append(str(tmp_path))
+    requested = []
+
+    def fake_download(repo_id, target_dir, files=tagger_node.TAGGER_REPO_FILES):
+        requested.append((repo_id, target_dir))
+        os.makedirs(target_dir, exist_ok=True)
+        Path(target_dir, "config.json").write_text("{}", encoding="utf-8")
+        Path(target_dir, "model.safetensors").write_bytes(b"")
+        return target_dir
+
+    monkeypatch.setattr(tagger_node, "_download_model", fake_download)
+    monkeypatch.setattr(tagger_node, "_load_tagger", lambda *args: _FakeTagger(_fake_config()))
+
+    kwargs = _node_kwargs(auto_download=[True], download_repo=["someone/other-tagger"])
+    tags, merged_tags, scores_json = DanbooruPixAITaggerNode().tag(**kwargs)
+
+    assert requested == [("someone/other-tagger", os.path.join(str(tmp_path), "other-tagger"))]
+    assert tags == [""] and merged_tags == ""
+    assert json.loads(scores_json[0]) == {"general": {}, "character": {}, "rating": {}}
+
+
+def test_tag_rejects_a_download_that_produced_no_model(monkeypatch, tmp_path, tagger_model_dirs):
+    tagger_model_dirs.append(str(tmp_path))
+    monkeypatch.setattr(tagger_node, "_download_model", lambda *args, **kwargs: str(tmp_path / "empty"))
+
+    with pytest.raises(RuntimeError, match="did not provide config.json"):
+        DanbooruPixAITaggerNode().tag(**_node_kwargs(auto_download=[True]))
+
+
+def test_download_model_fetches_every_needed_file(monkeypatch, tmp_path):
+    # huggingface_hub is imported inside the helper, so a stub module is enough to test the wiring.
+    fetched = []
+
+    class _Sibling:
+        def __init__(self, name, size):
+            self.rfilename = name
+            self.size = size
+
+    class _Info:
+        siblings = [_Sibling("config.json", 10), _Sibling("model.safetensors", 990), _Sibling("banner.png", 5000)]
+
+    class _Api:
+        def model_info(self, repo_id, files_metadata=False):
+            assert repo_id == "owner/repo"
+            return _Info()
+
+    def fake_hf_hub_download(repo_id, filename, local_dir):
+        fetched.append((repo_id, filename))
+        path = Path(local_dir) / filename
+        path.write_bytes(b"x" * 10)
+        return str(path)
+
+    module = types.ModuleType("huggingface_hub")
+    module.HfApi = _Api
+    module.hf_hub_download = fake_hf_hub_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", module)
+
+    target = str(tmp_path / "downloaded")
+    assert tagger_node._download_model("owner/repo", target) == target
+
+    assert fetched == [("owner/repo", "config.json"), ("owner/repo", "preprocessor_config.json"), ("owner/repo", "model.safetensors")]
+    assert (Path(target) / "config.json").is_file()
 
 
 def test_vendored_model_code_exposes_what_the_node_imports():

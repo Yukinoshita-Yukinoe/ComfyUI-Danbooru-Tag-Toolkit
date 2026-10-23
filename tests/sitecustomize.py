@@ -36,11 +36,23 @@ class _PromptServer:
 
 
 class _ProgressBar:
-    def __init__(self, total):
+    """Mirrors comfy.utils.ProgressBar closely enough for the nodes under test."""
+
+    def __init__(self, total, node_id=None):
         self.total = total
+        self.current = 0
+        self.node_id = node_id
+        self.updates = []
 
     def update(self, value):
-        pass
+        self.current += value
+        self.updates.append(self.current)
+
+    def update_absolute(self, value, total=None, preview=None):
+        if total is not None:
+            self.total = total
+        self.current = value
+        self.updates.append(value)
 
 
 def install_comfyui_stubs():

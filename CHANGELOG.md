@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **PixAI Tagger downloads its weights on the first run**, so a fresh install works without a manual
+  download step. `auto_download` (on by default) fetches `download_repo` into `models/taggers/` with a
+  progress bar, and `HF_ENDPOINT` mirrors and interrupted downloads keep working. `download_repo` points at
+  a different repo when the weights are mirrored elsewhere.
+
 ## 1.3.0 - 2026-10-21
 
 ### Added

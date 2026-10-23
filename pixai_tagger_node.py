@@ -23,9 +23,12 @@ else:
 
 TAGGER_FOLDER_NAME = "taggers"
 TAGGER_INPUT_SIZE = 1008
-MISSING_MODEL_ENTRY = "(no model in models/taggers)"
 MAX_TAGS_PER_CATEGORY_LIMIT = 500
 DEFAULT_EXCLUDE_CATEGORIES = "meta, rating"
+DEFAULT_TAGGER_REPO = "pixai-labs/pixai-tagger-v1.0"
+DEFAULT_TAGGER_NAME = os.path.basename(DEFAULT_TAGGER_REPO)
+# The weights repo also ships banner.png, figures/ and eval data; only these are needed to run.
+TAGGER_REPO_FILES = ("config.json", "preprocessor_config.json", "model.safetensors")
 
 # Per-category macro-F1 thresholds recommended by the model card.
 TAGGER_CATEGORY_THRESHOLDS = {
@@ -81,6 +84,11 @@ def _list_tagger_models() -> List[str]:
     return names
 
 
+def _tagger_base_dir() -> str:
+    paths = folder_paths.get_folder_paths(TAGGER_FOLDER_NAME)
+    return paths[0] if paths else os.path.join(folder_paths.models_dir, TAGGER_FOLDER_NAME)
+
+
 def _resolve_tagger_dir(model_name: str) -> str:
     name = str(model_name or "").strip()
     if not name or name != os.path.basename(name) or name in {".", ".."}:
@@ -90,6 +98,72 @@ def _resolve_tagger_dir(model_name: str) -> str:
         if _is_tagger_model_dir(candidate):
             return candidate
     return ""
+
+
+def _folder_size(path: str) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def _download_model(repo_id: str, target_dir: str, files: Tuple[str, ...] = TAGGER_REPO_FILES) -> str:
+    """Fetch the checkpoint from the Hub into models/taggers/<repo name>."""
+    try:
+        from huggingface_hub import HfApi, hf_hub_download
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Downloading the PixAI Tagger weights needs huggingface_hub, which ships with the "
+            "'transformers' requirement."
+        ) from exc
+
+    repo_id = str(repo_id or "").strip() or DEFAULT_TAGGER_REPO
+    os.makedirs(target_dir, exist_ok=True)
+    try:
+        expected = sum(
+            sibling.size or 0
+            for sibling in HfApi().model_info(repo_id, files_metadata=True).siblings
+            if sibling.rfilename in files
+        )
+    except Exception as exc:
+        print(f"[DanbooruTagToolkit] Could not read the size of {repo_id}: {exc}")
+        expected = 0
+
+    print(
+        f"[DanbooruTagToolkit] Downloading {repo_id} to {target_dir}"
+        + (f" (~{expected / 1024 ** 3:.1f} GB)" if expected else "")
+    )
+    progress = comfy.utils.ProgressBar(1000)
+    stop = threading.Event()
+
+    def report_size():
+        # The Hub downloads into the target folder, so watching its size gives real byte progress
+        # without depending on the transfer internals.
+        while not stop.wait(1.0):
+            if expected:
+                done = min(_folder_size(target_dir), expected)
+                progress.update_absolute(min(999, int(done * 1000 / expected)), 1000)
+
+    watcher = threading.Thread(target=report_size, daemon=True)
+    watcher.start()
+    started = time.perf_counter()
+    try:
+        for name in files:
+            hf_hub_download(repo_id=repo_id, filename=name, local_dir=target_dir)
+    finally:
+        stop.set()
+        watcher.join(timeout=2)
+    progress.update_absolute(1000, 1000)
+
+    print(
+        f"[DanbooruTagToolkit] Downloaded {repo_id} in {time.perf_counter() - started:.0f}s "
+        f"({_folder_size(target_dir) / 1024 ** 3:.2f} GB on disk)"
+    )
+    return target_dir
 
 
 def _pick_device(device: Any) -> torch.device:
@@ -256,16 +330,21 @@ def _flatten_images(images: Any) -> List[torch.Tensor]:
 class DanbooruPixAITaggerNode:
     DESCRIPTION = (
         "Tags local images with PixAI Tagger v1.0 (30,877 Danbooru tags in six categories) and feeds the "
-        "Danbooru Tag Toolkit sorter. Weights go into ComfyUI/models/taggers/<name>/."
+        "Danbooru Tag Toolkit sorter. Weights go into ComfyUI/models/taggers/<name>/ and download on the "
+        "first run unless auto_download is turned off."
     )
 
     @classmethod
     def INPUT_TYPES(cls):
+        # The default entry is listed even before it exists on disk: a workflow saved on a machine that
+        # has the weights must still validate on one that does not, otherwise the download never runs.
         models = _list_tagger_models()
+        if DEFAULT_TAGGER_NAME not in models:
+            models = [DEFAULT_TAGGER_NAME, *models]
         return {
             "required": {
                 "image": ("IMAGE",),
-                "model": (models or [MISSING_MODEL_ENTRY], {"tooltip": "Folder inside ComfyUI/models/taggers/."}),
+                "model": (models, {"tooltip": "Folder inside ComfyUI/models/taggers/. The default entry downloads on the first run."}),
                 "device": (["auto", "cuda", "cpu"], {"default": "auto"}),
                 "dtype": (["auto", "bf16", "fp16", "fp32"], {"default": "auto"}),
                 "threshold_general": ("FLOAT", {"default": TAGGER_CATEGORY_THRESHOLDS["general"], "min": 0.0, "max": 1.0, "step": 0.01}),
@@ -279,6 +358,8 @@ class DanbooruPixAITaggerNode:
                 "max_tags_per_category": ("INT", {"default": 0, "min": 0, "max": MAX_TAGS_PER_CATEGORY_LIMIT, "step": 1}),
                 "replace_underscore": ("BOOLEAN", {"default": False, "label": "空格替换下划线"}),
                 "free_after_run": ("BOOLEAN", {"default": False, "label": "跑完释放显存"}),
+                "auto_download": ("BOOLEAN", {"default": True, "label": "缺模型时自动下载", "tooltip": "First run downloads the weights from the Hub into ComfyUI/models/taggers/. Turn it off to stay offline."}),
+                "download_repo": ("STRING", {"default": DEFAULT_TAGGER_REPO, "tooltip": "Hub repo used by auto_download. Set HF_ENDPOINT for a mirror."}),
             },
         }
 
@@ -306,6 +387,8 @@ class DanbooruPixAITaggerNode:
         max_tags_per_category=0,
         replace_underscore=False,
         free_after_run=False,
+        auto_download=True,
+        download_repo=DEFAULT_TAGGER_REPO,
     ):
         if ViTDetCls is None:
             raise RuntimeError(f"PixAI Tagger needs transformers and timm: {PIXAI_IMPORT_ERROR}")
@@ -316,10 +399,20 @@ class DanbooruPixAITaggerNode:
 
         model_name = str(_first(model) or "")
         model_dir = _resolve_tagger_dir(model_name)
+        if not model_dir and bool(_first(auto_download)):
+            repo_id = str(_first(download_repo) or "").strip() or DEFAULT_TAGGER_REPO
+            model_dir = _download_model(repo_id, os.path.join(_tagger_base_dir(), os.path.basename(repo_id)))
+            model_name = os.path.basename(model_dir)
+            if not _is_tagger_model_dir(model_dir):
+                raise RuntimeError(
+                    f"{repo_id} did not provide config.json and a .safetensors file, so {model_dir} is not "
+                    "a usable model. Check download_repo, or download the weights manually."
+                )
         if not model_dir:
             raise RuntimeError(
-                f"PixAI Tagger model {model_name!r} not found. Put the weights in "
-                "ComfyUI/models/taggers/pixai-tagger-v1.0 (see the PixAI Tagger section in README.md)."
+                f"PixAI Tagger model {model_name!r} not found and auto_download is off. Put the weights in "
+                "ComfyUI/models/taggers/pixai-tagger-v1.0, or turn auto_download back on "
+                "(see the PixAI Tagger section in README.md)."
             )
 
         torch_device = _pick_device(_first(device))

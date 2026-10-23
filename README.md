@@ -158,18 +158,22 @@ Notes:
 (30,877 Danbooru tags in six categories), so the toolkit works offline on local files instead of only on
 Danbooru posts.
 
-### Install the model
+### Weights
 
-The node reads `ComfyUI/models/taggers/<name>/`. Download the weights once:
+The node reads `ComfyUI/models/taggers/<name>/` and **downloads the weights on the first run** when that
+folder is empty, with a progress bar in the UI. Nothing else in the toolkit downloads anything.
+
+- Only `config.json`, `preprocessor_config.json` and `model.safetensors` (~1.9 GB) are fetched; the model's
+  code is vendored in `vendor/pixai_tagger/`, so the node never executes code that came with the weights.
+- If huggingface.co is slow or blocked, set `HF_ENDPOINT=https://hf-mirror.com` before starting ComfyUI.
+  Downloads resume: an interrupted run continues from the partial file.
+- Turn off `auto_download` to stay offline, then place the files yourself:
 
 ```bash
 hf download pixai-labs/pixai-tagger-v1.0 --local-dir ComfyUI/models/taggers/pixai-tagger-v1.0
 ```
 
-If huggingface.co is blocked, set `HF_ENDPOINT=https://hf-mirror.com` (or download the same files with any
-other tool) before running that command. Only `config.json`, `preprocessor_config.json` and
-`model.safetensors` are required: the model's code is vendored in `vendor/pixai_tagger/`, so the node never
-executes code that came with the weights and never downloads anything itself.
+- `download_repo` points the download at a different Hub repo if you mirror the weights yourself.
 
 Optional: `python scripts/convert_pixai_tagger_bf16.py ComfyUI/models/taggers/pixai-tagger-v1.0` writes a
 bfloat16 copy next to it (1.9 GB -> 0.9 GB, identical results, faster first load).
@@ -178,7 +182,9 @@ bfloat16 copy next to it (1.9 GB -> 0.9 GB, identical results, faster first load
 
 | Input | Default | Notes |
 |---|---|---|
-| `model` | first folder found | every folder under `models/taggers/` with `config.json` + a `.safetensors` file |
+| `model` | `pixai-tagger-v1.0` | every folder under `models/taggers/` with `config.json` + a `.safetensors` file. The default name is listed even before it is downloaded, so a workflow saved on another machine still validates. |
+| `auto_download` | on | fetches `download_repo` into `models/taggers/` when the selected model is missing |
+| `download_repo` | `pixai-labs/pixai-tagger-v1.0` | Hub repo used by `auto_download` |
 | `device` / `dtype` | `auto` | `auto` uses ComfyUI's device, bfloat16 on CUDA and float32 on CPU |
 | `threshold_general` / `character` / `copyright` / `style` / `meta` / `rating` | `0.17` / `0.27` / `0.24` / `0.15` / `0.17` / `0.41` | the model card's per-category macro-F1 values |
 | `exclude_categories` | `meta, rating` | keeps `highres`, `rating:s`, ... out of dataset captions |
@@ -347,8 +353,9 @@ So existing Chinese workflows keep working, and English-based presets can also b
 ## Networking / Privacy
 
 - All Danbooru access is anonymous; no API key is required and nothing is uploaded.
-- The only outbound requests are to `danbooru.donmai.us` (API + images) issued from your own ComfyUI server.
-  The PixAI Tagger node is fully offline: you download its weights yourself.
+- The only outbound requests are to `danbooru.donmai.us` (API + images) issued from your own ComfyUI server,
+  plus the one-time PixAI Tagger weight download from huggingface.co (or your `HF_ENDPOINT` mirror).
+  Turn off `auto_download` and the node never reaches the network.
 - Danbooru API calls are throttled to 1 request/second and cached (posts 2 min, autocomplete 5 min, artist lookups 15 min).
 - Image bytes are streamed through the local server instead of being embedded from the CDN in the browser.
 - Prompt-library data stays in `prompt_selector/data.json` inside this node folder.
@@ -361,7 +368,8 @@ So existing Chinese workflows keep working, and English-based presets can also b
 | A card shows `Retry` | The thumbnail could not be fetched after retries - click `Retry`; the post itself stays selected/usable. |
 | Images look cropped | Check the canvas zoom; the gallery now compensates for it. If it still happens, please report the post URL. |
 | Pasting a URL finds nothing | That artwork was likely never uploaded to Danbooru; the status line will say so. |
-| PixAI Tagger says `weights not found` | The `model` dropdown only lists folders in `ComfyUI/models/taggers/` that contain `config.json` + a `.safetensors` file. Download the weights there and hard-refresh so the node list rebuilds. |
+| PixAI Tagger says the model is missing | `auto_download` is off, or the download failed. Turn it on, or put `config.json` + a `.safetensors` file in `ComfyUI/models/taggers/<name>/` and hard-refresh so the node list rebuilds. |
+| PixAI Tagger download stalls on a fresh machine | huggingface.co is slow or blocked; set `HF_ENDPOINT=https://hf-mirror.com` and restart ComfyUI. Re-running resumes the partial download. |
 | PixAI Tagger runs out of VRAM next to the checkpoint | Turn on `free_after_run` (releases ~1.1 GB after each run) or set `device=cpu` (slower). |
 | Node UI looks stale after updating | Hard-refresh the browser (`Ctrl+F5`) and restart ComfyUI. |
 
