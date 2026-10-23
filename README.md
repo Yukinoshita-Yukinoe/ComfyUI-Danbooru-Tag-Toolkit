@@ -203,6 +203,15 @@ How tags are matched, shared with the rest of the toolkit:
 - a tag in both boxes ends up **removed** (the remove box wins)
 - when nothing matches, the prompt is returned byte for byte, so it can sit in a graph without reformatting
 
+The two boxes accept full-width punctuation (`，`, `、`, `；`) as separators as well, so a Chinese tag list can
+be pasted straight in. The prompt itself keeps its own separators, so a Chinese sentence in it is never
+rewritten. A weighted group typed into `add_tags` keeps its weight (`(blue eyes:1.2)` stays a weight, while a
+real tag such as `utdr_(toby_fox)` is escaped for ComfyUI).
+
+A tag can only be removed when it is a tag. If a listed tag exists only glued into longer text — `explicit`
+at the end of `cos的角色是explicit`, with no separator before it — the node leaves the text alone and prints
+one line saying so, because cutting it out by substring would leave broken text behind.
+
 ```
 prompt:  1girl, solo, long hair
 add:     smile

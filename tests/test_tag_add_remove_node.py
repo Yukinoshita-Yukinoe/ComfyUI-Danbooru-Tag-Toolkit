@@ -167,3 +167,70 @@ def test_a_tag_containing_a_comma_cannot_be_split_out():
 
     assert prompt == "1girl, bow, ribbon"
     assert added == "bow, ribbon"
+
+def test_full_width_commas_separate_the_input_boxes():
+    prompt, added, removed = run("1girl, solo", add_tags="微笑，长发", remove_tags="")
+
+    assert added == "微笑, 长发"
+    assert prompt == "1girl, solo, 微笑, 长发"
+
+    prompt, _, removed = run("1girl, solo, 微笑, 长发", remove_tags="微笑；长发")
+    assert prompt == "1girl, solo"
+    assert removed == "微笑, 长发"
+
+
+def test_full_width_commas_inside_a_weighted_group_are_left_alone():
+    prompt, added, _ = run("1girl", add_tags="(blue eyes:1.2)，smile")
+
+    assert added == "(blue eyes:1.2), smile"
+    assert prompt == "1girl, (blue eyes:1.2), smile"
+    assert "blue eyes:1.2" in prompt
+
+
+def test_the_prompt_keeps_its_own_full_width_commas():
+    # A Chinese sentence is one part, not a tag list: nothing is added or removed, so it passes through
+    # byte for byte instead of being rewritten with half-width commas.
+    original = "真实Cosplay摄影风格，亚洲coser，cos的角色是explicit"
+    prompt, added, removed = run(original)
+
+    assert prompt == original
+    assert (added, removed) == ("", "")
+
+
+def test_a_tag_glued_into_longer_text_is_reported_not_removed(capsys):
+    # The reported case: "explicit" is the tail of a Chinese sentence, with no separator before it, so it
+    # is not a tag at all and removing it by substring would leave broken text behind.
+    original = "真实Cosplay摄影风格，亚洲coser，cos的角色是explicit, normal quality"
+    prompt, _, removed = run(original, remove_tags="explicit, normal quality")
+
+    assert removed == "normal quality"
+    assert "explicit" in prompt
+    assert "cos的角色是explicit" in prompt
+    assert "explicit" in capsys.readouterr().out
+
+
+def test_tags_that_are_simply_absent_are_not_reported(capsys):
+    prompt, _, removed = run("1girl, solo", remove_tags="worst quality, censored")
+
+    assert removed == ""
+    assert prompt == "1girl, solo"
+    assert capsys.readouterr().out == ""
+
+def test_a_danbooru_tag_with_parentheses_is_still_escaped():
+    _, added, _ = run("1girl", add_tags="utdr_(toby_fox)")
+
+    assert added == "utdr_\\(toby_fox\\)"
+
+def test_a_tag_that_is_a_substring_of_another_tag_is_not_reported(capsys):
+    # "censored" lives inside "uncensored", which is a different tag, not text glued to it.
+    prompt, _, removed = run("1girl, uncensored", remove_tags="censored")
+
+    assert (prompt, removed) == ("1girl, uncensored", "")
+    assert capsys.readouterr().out == ""
+
+
+def test_a_tag_glued_to_chinese_is_reported_once(capsys):
+    prompt, _, _ = run("cos的角色是explicit, 1girl", remove_tags="explicit, explicit")
+
+    assert "cos的角色是explicit" in prompt
+    assert capsys.readouterr().out.count("explicit") == 1

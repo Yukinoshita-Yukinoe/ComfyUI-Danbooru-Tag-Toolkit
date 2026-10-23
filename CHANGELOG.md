@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Tag Add / Remove** reads its two boxes the way tags are actually typed: full-width punctuation (`，`,
+  `、`, `；`) now separates entries, and a weighted group typed into `add_tags` keeps its weight instead of
+  being escaped into literal parentheses. The prompt itself still keeps its own separators, so a Chinese
+  sentence in it is not rewritten. When a listed tag only exists glued into longer text (no separator, e.g.
+  `explicit` at the end of `cos的角色是explicit`), the node reports it once in the console instead of
+  appearing to do nothing; tags that are simply absent, or that are only a substring of another tag such as
+  `censored` in `uncensored`, stay quiet.
+
 ### Added
 
 - **Node Presets sidebar** (`参数预设`, bookmark icon): saves several parameter sets per node and brings

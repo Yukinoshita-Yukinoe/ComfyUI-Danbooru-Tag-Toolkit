@@ -4,6 +4,7 @@ Tag identity follows the rest of the toolkit: case-insensitive, underscores equa
 Danbooru parenthesis is the same as a bare one, and a weighted group counts as its inner tags.
 """
 
+import re
 from typing import List, Set
 
 from .node import (
@@ -61,11 +62,88 @@ def _entry_keys(text) -> List[str]:
     return keys
 
 
+BOX_SEPARATORS = "，、；"
+_NON_ASCII = re.compile(r"[^\x00-\x7F]")
+
+
+def _box_entries(raw_value) -> List[str]:
+    """Entries of an input box. Full-width punctuation separates them here, but the prompt keeps its own
+    separators so a Chinese sentence in it is never rewritten."""
+    text = str(raw_value or "")
+    if not any(separator in text for separator in BOX_SEPARATORS):
+        return _split_top_level_prompt_parts(text)
+
+    normalized: List[str] = []
+    depth = 0
+    escaped = False
+    for char in text:
+        if escaped:
+            normalized.append(char)
+            escaped = False
+        elif char == "\\":
+            normalized.append(char)
+            escaped = True
+        elif char == "(":
+            depth += 1
+            normalized.append(char)
+        elif char == ")":
+            depth = max(0, depth - 1)
+            normalized.append(char)
+        elif depth == 0 and char in BOX_SEPARATORS:
+            normalized.append(",")
+        else:
+            normalized.append(char)
+    return _split_top_level_prompt_parts("".join(normalized))
+
+
 def _input_keys(raw_value: str) -> Set[str]:
     keys: Set[str] = set()
-    for part in _split_top_level_prompt_parts(raw_value):
+    for part in _box_entries(raw_value):
         keys.update(_entry_keys(part))
     return keys
+
+
+def _render_addition(entry: str) -> str:
+    """A weighted group typed into the box keeps its weight; anything else is a tag, so its parentheses are
+    escaped for ComfyUI (an unescaped Danbooru tag such as utdr_(toby_fox) would read as a weight group)."""
+    weighted = _parse_weighted_prompt_part(entry)
+    if weighted:
+        return _build_weighted_prompt_part(weighted["tags"], weighted["weight"])
+    return _escape_unescaped_parentheses(str(entry).strip())
+
+
+def _is_glued(key: str, prompt_key: str) -> bool:
+    """True when the key only shows up touching non-ASCII text, which means it sits inside a sentence rather
+    than being a tag. A plain substring of a longer tag (censored in uncensored) is a different tag, not glue."""
+    start = prompt_key.find(key)
+    while start != -1:
+        before = prompt_key[start - 1] if start else ""
+        after_end = start + len(key)
+        after = prompt_key[after_end] if after_end < len(prompt_key) else ""
+        if _NON_ASCII.match(before) or _NON_ASCII.match(after):
+            return True
+        start = prompt_key.find(key, start + 1)
+    return False
+
+
+def _report_glued(remove_tags: str, parts: List[str], present_keys: Set[str]) -> None:
+    """A listed tag that only exists glued into longer text cannot be removed as a tag, and silently doing
+    nothing is confusing. Only entries that really sit inside a sentence are reported, so an ordinary list of
+    tags that simply are not there stays quiet."""
+    prompt_keys = [_tag_key(part) for part in parts]
+    glued: List[str] = []
+    for entry in _box_entries(remove_tags):
+        if any(key in present_keys for key in _entry_keys(entry)):
+            continue
+        key = _tag_key(entry)
+        if key and key not in glued and any(_is_glued(key, prompt_key) for prompt_key in prompt_keys):
+            glued.append(key)
+    if glued:
+        print(
+            "[Danbooru Tag Toolkit] 这些 tag 在提示词里和别的文字连在一起，不是独立 tag，所以没有删除："
+            + "、".join(glued[:3])
+            + ("…" if len(glued) > 3 else "")
+        )
 
 
 def _drop_removed(parts: List[str], remove_keys: Set[str], removed: List[str]) -> List[str]:
@@ -136,10 +214,12 @@ class DanbooruTagAddRemoveNode:
         present_keys = set()
         for part in parts:
             present_keys.update(_entry_keys(part))
+        if remove_keys:
+            _report_glued(remove_tags, parts, present_keys)
 
         additions: List[str] = []
         added_keys: Set[str] = set()
-        for entry in _split_top_level_prompt_parts(add_tags):
+        for entry in _box_entries(add_tags):
             keys = _entry_keys(entry)
             if not keys or any(key in present_keys for key in keys):
                 continue
@@ -149,7 +229,7 @@ class DanbooruTagAddRemoveNode:
             if any(key in added_keys for key in keys):
                 continue
             added_keys.update(keys)
-            additions.append(_escape_unescaped_parentheses(str(entry).strip()))
+            additions.append(_render_addition(entry))
 
         if not additions and not removed:
             return (text, "", "")
