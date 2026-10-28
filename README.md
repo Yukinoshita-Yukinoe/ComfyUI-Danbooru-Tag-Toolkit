@@ -36,6 +36,7 @@ artist tags from external URLs, and manage a personal prompt library.
 | `Danbooru Tag Toolkit - Artist Lookup` | `DanbooruArtistLookupNode` | Resolves artist tags from a post source URL, an artist page URL or the original file md5.<br>Outputs: `artist_tags`, `artists` (list), `source`, `post_id`, `matched_by` |
 | `Danbooru Tag Toolkit - Specific Tag Cleaner` | `DanbooruTagSpecificCleanerNode` | Removes tags covered by a more specific tag (`jacket` vs `white jacket`).<br>Outputs: `cleaned_prompt`, `removed_tags`, `cleaned_prompt_list`, `removed_tags_list` |
 | `Danbooru Tag Toolkit - Tag Add / Remove` | `DanbooruTagAddRemoveNode` | Adds tags the prompt is missing and removes the ones you list.<br>Outputs: `prompt`, `added_tags`, `removed_tags` |
+| `Danbooru Tag Toolkit - Category Filter` | `DanbooruTagCategoryFilterNode` | Keeps or drops whole tag categories from a clickable, draggable chip list.<br>Outputs: `prompt`, `removed_tags` |
 | `Danbooru Tag Toolkit - PixAI Tagger` | `DanbooruPixAITaggerNode` | Tags local images with PixAI Tagger v1.0 (30,877 Danbooru tags, six categories).<br>Outputs: `tags` (list), `merged_tags`, `scores_json` |
 | `Danbooru Tag Toolkit - Lineart Trace` | `DanbooruLineartTraceNode` | Retraces black line art into smooth antialiased curves (Potrace), transparent background by default.<br>Outputs: `image` |
 | `Danbooru Tag Toolkit - Dataset Saver` | `DanbooruDatasetSaverNode` | Saves images with matching `.txt` caption files (optional previews, optional embedded workflow). |
@@ -176,6 +177,35 @@ Notes:
 - URLs are normalized before matching (`/en/` prefix, trailing slash, `#fragment`, host case).
 - A `403 Forbidden` from Danbooru is usually Cloudflare rate limiting: the node reports it as a temporary limit and
   falls back to a plain request when only the custom `User-Agent` was rejected.
+
+## Category Filter
+
+`Danbooru Tag Toolkit - Category Filter` filters a prompt by category instead of by individual tag. The node
+lists the twelve toolkit categories as chips — 画师词, 背景词, 人物对象词, 角色特征词, 角色五官词, 角色部位词,
+性征部位词, 服饰词, 动作词, 角色表情词, 镜头词, 未归类词 — and you click one to include or drop it, and drag to
+reorder them.
+
+| | `exclude_mode` off (default) | `exclude_mode` on |
+|---|---|---|
+| A selected category | its tags are kept | its tags are dropped |
+| An unselected category | its tags are dropped | its tags are kept |
+
+- The categories are the ones All-in-One uses: same `danbooru_tags.xlsx`, same default mapping and order from
+  `defaults_config.json`, so 服饰词 means the same tags in both nodes. Anything the database does not know
+  counts as 未归类词, exactly as it does there.
+- The output is grouped in chip order, so dragging 服饰词 to the front puts every outfit tag first. Every
+  category starts selected, so a freshly added node only regroups; deselect a category to filter with it.
+- A weighted group `(a, b:1.2)` stays together and counts as its first tag, and `long_hair` matches
+  `long hair` like everywhere else in the toolkit.
+- `removed_tags` reports what was dropped, and the selection plus its order travel inside the workflow.
+
+```
+prompt:  long hair, 1girl, school uniform, city, smile, from above, solo, masterpiece
+
+keep only 服饰词 + 背景词 + 角色表情词:
+  prompt:  city, school uniform, smile
+  removed: long hair, 1girl, from above, solo, masterpiece
+```
 
 ## Tag Add / Remove
 

@@ -14,6 +14,11 @@
 
 ### Added
 
+- **Category Filter node** (`DanbooruTagCategoryFilterNode`): filters a prompt by category instead of by tag.
+  The node draws the twelve toolkit categories as chips (click to include or drop, drag to reorder) and has an
+  `exclude_mode` switch, off by default, that drops the selected categories instead. Output is grouped in chip
+  order, `removed_tags` reports what was dropped, categories and their order come from the same database and
+  mapping All-in-One uses, and the selection travels inside the workflow.
 - **Node Presets sidebar** (`参数预设`, bookmark icon): saves several parameter sets per node and brings
   them back with one click, across workflows. Groups are keyed by node type plus the node's title, only the
   current workflow's nodes are listed, and presets are stored in `user/default/node_presets.json` through
